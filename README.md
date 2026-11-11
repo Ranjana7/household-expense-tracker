@@ -13,12 +13,28 @@ This project uses a static JavaScript frontend and Supabase backend instead of N
 
 ## Features
 
-- Quick expense entry: amount, date, category, description, who paid, optional notes
-- Add, edit, delete, search, filter expenses
-- Dashboard: this month total, by category, by person, 6-month trend
-- Monthly budget with clear approaching/exceeded status
+- Fast expense entry with category + classification (`essential`, `reducible`, `optional`)
+- Income tracking (salary/other), including one-off and recurring income
+- Recurring expenses (mortgage, electricity, broadband, subscriptions, etc.)
+- Dashboard-first view:
+  - total monthly income and expenses
+  - essential/reducible/optional monthly totals
+  - monthly surplus/shortfall
+  - category/classification/person breakdowns
+  - income and expense trends
+- "What If?" planner:
+  - both incomes, one-income, or custom income scenarios
+  - optional spending reduction simulation
+  - projected surplus/shortfall
+- Budget discovery from actual history:
+  - average monthly spending
+  - minimum essential monthly spending
+  - average optional spending
+  - irregular annual expenses converted to monthly equivalents
+  - suggested monthly target
+- Optional category budgets
 - EUR formatting with Ireland locale (`en-IE`)
-- CSV export
+- CSV and Excel export
 - Backup and restore via JSON
 
 ## Stack
@@ -54,15 +70,16 @@ npm run dev
 ## Security model
 
 - App access requires sign-in.
-- Supabase RLS policies enforce that only household members can read/write that household's expenses and budget.
+- Supabase RLS policies enforce that only household members can read/write household incomes, expenses, recurring items, and budgets.
 - Data isolation is enforced in database policies, not hidden frontend routes.
+- Join flow enforces max two authorized household members.
 - No service-role keys are used in frontend.
 
 ## Backup/restore
 
-- **Backup JSON** exports household budget + expenses.
+- **Backup JSON** exports incomes, expenses, recurring data, and budgets.
 - **Restore JSON** validates household ID and upserts records.
-- **Export CSV** gives a spreadsheet-friendly copy.
+- **Export CSV/Excel** gives spreadsheet-friendly copies.
 
 ## Deploy (private repo + free host)
 

@@ -132,8 +132,16 @@ button.small {
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
 }
 
+.cards5 {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
 .cards3 {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.cards2 {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 
 .stat h3 {
@@ -220,6 +228,16 @@ button.small {
   grid-column: 1 / -1;
 }
 
+.checkbox-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.checkbox-inline input {
+  width: auto;
+}
+
 .actions {
   grid-column: 1 / -1;
   display: flex;
@@ -282,6 +300,35 @@ th {
   gap: 0.45rem;
 }
 
+.simple-list {
+  margin-top: 0.8rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.list-row {
+  border: 1px solid #dbe5f2;
+  border-radius: 10px;
+  padding: 0.7rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.7rem;
+  align-items: start;
+}
+
+.danger-text {
+  color: #c12738;
+}
+
+.warn-text {
+  color: #a66f00;
+}
+
+.scenario-grid {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  margin-bottom: 0.8rem;
+}
+
 code {
   padding: 0.16rem 0.35rem;
   border-radius: 5px;
@@ -303,6 +350,10 @@ code {
 
   .topbar {
     align-items: start;
+    flex-direction: column;
+  }
+
+  .list-row {
     flex-direction: column;
   }
 }
