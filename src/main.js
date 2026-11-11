@@ -1,9 +1,33 @@
-import { createClient } from '@supabase/supabase-js';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  onAuthStateChanged,
+  sendSignInLinkToEmail,
+  isSignInWithEmailLink,
+  signInWithEmailLink,
+  signOut,
+} from 'firebase/auth';
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  addDoc,
+  getDocs,
+  collection,
+  onSnapshot,
+} from 'firebase/firestore';
 import { utils, writeFileXLSX } from 'xlsx';
 import './style.css';
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const FIREBASE_API_KEY = import.meta.env.VITE_FIREBASE_API_KEY;
+const FIREBASE_AUTH_DOMAIN = import.meta.env.VITE_FIREBASE_AUTH_DOMAIN;
+const FIREBASE_PROJECT_ID = import.meta.env.VITE_FIREBASE_PROJECT_ID;
+const FIREBASE_APP_ID = import.meta.env.VITE_FIREBASE_APP_ID;
+const HOUSEHOLD_ID = import.meta.env.VITE_HOUSEHOLD_ID || 'main-household';
+const APPROVED_USERS_JSON = import.meta.env.VITE_APPROVED_USERS_JSON || '[]';
 const CATEGORY_OPTIONS = ['Groceries', 'Utilities', 'Transport', 'Dining', 'Health', 'Shopping', 'Home', 'Kids', 'Mortgage', 'Insurance', 'Subscriptions', 'Other'];
 const EXPENSE_CLASSIFICATIONS = [
   { value: 'essential', label: 'Essential' },
@@ -41,8 +65,11 @@ const state = {
   },
 };
 
-let supabase = null;
-let householdChannel = null;
+let db = null;
+let auth = null;
+let unsubscribeFns = [];
+let approvedUsers = [];
+let approvedByEmail = new Map();
 
 function renderShell() {
   document.querySelector('#app').innerHTML = `
@@ -368,11 +395,40 @@ function setVisibleView(view) {
   document.querySelector(view).classList.remove('hidden');
 }
 
-function ensureSupabaseConfigured() {
-  if (SUPABASE_URL && SUPABASE_ANON_KEY) return true;
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function sha256Hex(value) {
+  const data = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function parseApprovedUsers() {
+  try {
+    const parsed = JSON.parse(APPROVED_USERS_JSON);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((x) => ({
+        email: normalizeEmail(x.email),
+        name: String(x.name || '').trim(),
+        dobHash: String(x.dobHash || '').trim().toLowerCase(),
+      }))
+      .filter((x) => x.email && x.name && x.dobHash.length === 64);
+  } catch {
+    return [];
+  }
+}
+
+function ensureFirebaseConfigured() {
+  if (FIREBASE_API_KEY && FIREBASE_AUTH_DOMAIN && FIREBASE_PROJECT_ID && FIREBASE_APP_ID) return true;
   const error = document.querySelector('#configError');
   error.classList.remove('hidden');
-  error.innerHTML = 'Missing <code>VITE_SUPABASE_URL</code> or <code>VITE_SUPABASE_ANON_KEY</code> in <code>.env.local</code>.';
+  error.innerHTML =
+    'Missing Firebase config in <code>.env.local</code>: <code>VITE_FIREBASE_API_KEY</code>, <code>VITE_FIREBASE_AUTH_DOMAIN</code>, <code>VITE_FIREBASE_PROJECT_ID</code>, <code>VITE_FIREBASE_APP_ID</code>.';
   setVisibleView('#configError');
   return false;
 }
@@ -382,88 +438,118 @@ function memberName(userId) {
 }
 
 async function loadProfile() {
-  const { data, error } = await supabase.from('profiles').select('user_id, display_name').eq('user_id', state.session.user.id).single();
-  if (error) throw error;
-  state.profile = data;
+  const email = normalizeEmail(state.session?.email);
+  const approved = approvedByEmail.get(email);
+  if (!approved) throw new Error('This email is not approved for this tracker.');
+  state.profile = { user_id: email, display_name: approved.name };
 }
 
 async function loadHousehold() {
-  const { data: membership, error } = await supabase
-    .from('household_members')
-    .select('household_id')
-    .eq('user_id', state.session.user.id)
-    .maybeSingle();
-  if (error) throw error;
-  if (!membership) {
-    state.household = null;
-    return;
+  const householdRef = doc(db, 'households', HOUSEHOLD_ID);
+  const snap = await getDoc(householdRef);
+  if (!snap.exists()) {
+    await setDoc(householdRef, {
+      name: 'Our Household',
+      monthlyBudget: 0,
+      members: {
+        [state.profile.user_id]: state.profile.display_name,
+      },
+      updatedAt: Date.now(),
+    });
+  } else {
+    const members = snap.data().members || {};
+    if (!members[state.profile.user_id]) {
+      await updateDoc(householdRef, {
+        [`members.${state.profile.user_id}`]: state.profile.display_name,
+        updatedAt: Date.now(),
+      });
+    }
   }
-  const householdId = membership.household_id;
-  const { data: household, error: householdError } = await supabase.from('households').select('id, name').eq('id', householdId).single();
-  if (householdError) throw householdError;
-  state.household = household;
+
+  const refreshed = await getDoc(householdRef);
+  const data = refreshed.data();
+  state.household = { id: HOUSEHOLD_ID, name: String(data?.name || 'Our Household') };
+  state.monthlyBudget = Number(data?.monthlyBudget || 0);
+  const memberEntries = Object.entries(data?.members || {});
+  state.members = memberEntries.map(([user_id, display_name]) => ({ user_id, display_name: String(display_name) }));
 }
 
 async function loadMembers() {
-  const { data, error } = await supabase
-    .from('household_members')
-    .select('user_id, profiles!inner(display_name)')
-    .eq('household_id', state.household.id)
-    .order('user_id');
-  if (error) throw error;
-  state.members = data.map((row) => ({ user_id: row.user_id, display_name: row.profiles.display_name }));
+  await loadHousehold();
 }
 
 async function loadBudgets() {
-  const [monthlyBudgetResult, categoryBudgetResult] = await Promise.all([
-    supabase.from('monthly_budgets').select('amount_eur').eq('household_id', state.household.id).maybeSingle(),
-    supabase.from('category_budgets').select('category, amount_eur').eq('household_id', state.household.id).order('category'),
-  ]);
-  if (monthlyBudgetResult.error) throw monthlyBudgetResult.error;
-  if (categoryBudgetResult.error) throw categoryBudgetResult.error;
-  state.monthlyBudget = Number(monthlyBudgetResult.data?.amount_eur || 0);
-  state.categoryBudgets = categoryBudgetResult.data.map((row) => ({ category: row.category, amount: Number(row.amount_eur) }));
+  const householdSnap = await getDoc(doc(db, 'households', HOUSEHOLD_ID));
+  state.monthlyBudget = Number(householdSnap.data()?.monthlyBudget || 0);
+  const budgetsSnap = await getDocs(collection(db, 'households', HOUSEHOLD_ID, 'categoryBudgets'));
+  state.categoryBudgets = budgetsSnap.docs
+    .map((d) => ({ category: String(d.data().category || d.id), amount: Number(d.data().amount || 0) }))
+    .sort((a, b) => a.category.localeCompare(b.category));
 }
 
 async function loadExpenses() {
-  const { data, error } = await supabase
-    .from('expenses')
-    .select('id, amount, expense_date, category, classification, description, paid_by, notes, is_irregular_annual')
-    .eq('household_id', state.household.id)
-    .order('expense_date', { ascending: false })
-    .order('created_at', { ascending: false });
-  if (error) throw error;
-  state.expenses = data.map((row) => ({ ...row, amount: Number(row.amount) }));
+  const snap = await getDocs(collection(db, 'households', HOUSEHOLD_ID, 'expenses'));
+  state.expenses = snap.docs
+    .map((d) => ({
+      id: d.id,
+      amount: Number(d.data().amount || 0),
+      expense_date: String(d.data().expense_date),
+      category: String(d.data().category),
+      classification: String(d.data().classification || 'reducible'),
+      description: String(d.data().description || ''),
+      paid_by: String(d.data().paid_by || ''),
+      notes: String(d.data().notes || ''),
+      is_irregular_annual: Boolean(d.data().is_irregular_annual),
+    }))
+    .sort((a, b) => `${b.expense_date}-${b.id}`.localeCompare(`${a.expense_date}-${a.id}`));
 }
 
 async function loadIncomes() {
-  const { data, error } = await supabase
-    .from('incomes')
-    .select('id, amount, income_date, source, income_type, received_by, notes')
-    .eq('household_id', state.household.id)
-    .order('income_date', { ascending: false })
-    .order('created_at', { ascending: false });
-  if (error) throw error;
-  state.incomes = data.map((row) => ({ ...row, amount: Number(row.amount) }));
+  const snap = await getDocs(collection(db, 'households', HOUSEHOLD_ID, 'incomes'));
+  state.incomes = snap.docs
+    .map((d) => ({
+      id: d.id,
+      amount: Number(d.data().amount || 0),
+      income_date: String(d.data().income_date),
+      source: String(d.data().source || ''),
+      income_type: String(d.data().income_type || 'other'),
+      received_by: String(d.data().received_by || ''),
+      notes: String(d.data().notes || ''),
+    }))
+    .sort((a, b) => `${b.income_date}-${b.id}`.localeCompare(`${a.income_date}-${a.id}`));
 }
 
 async function loadRecurring() {
-  const [recExp, recInc] = await Promise.all([
-    supabase
-      .from('recurring_expenses')
-      .select('id, title, amount, category, cadence, next_due_date, notes, active')
-      .eq('household_id', state.household.id)
-      .order('next_due_date'),
-    supabase
-      .from('recurring_incomes')
-      .select('id, title, amount, income_type, cadence, next_due_date, received_by, notes, active')
-      .eq('household_id', state.household.id)
-      .order('next_due_date'),
+  const [recExpSnap, recIncSnap] = await Promise.all([
+    getDocs(collection(db, 'households', HOUSEHOLD_ID, 'recurringExpenses')),
+    getDocs(collection(db, 'households', HOUSEHOLD_ID, 'recurringIncomes')),
   ]);
-  if (recExp.error) throw recExp.error;
-  if (recInc.error) throw recInc.error;
-  state.recurringExpenses = recExp.data.map((row) => ({ ...row, amount: Number(row.amount) }));
-  state.recurringIncomes = recInc.data.map((row) => ({ ...row, amount: Number(row.amount) }));
+  state.recurringExpenses = recExpSnap.docs
+    .map((d) => ({
+      id: d.id,
+      title: String(d.data().title || ''),
+      amount: Number(d.data().amount || 0),
+      category: String(d.data().category || 'Other'),
+      cadence: String(d.data().cadence || 'monthly'),
+      next_due_date: String(d.data().next_due_date || todayIso()),
+      notes: String(d.data().notes || ''),
+      active: Boolean(d.data().active),
+    }))
+    .sort((a, b) => a.next_due_date.localeCompare(b.next_due_date));
+
+  state.recurringIncomes = recIncSnap.docs
+    .map((d) => ({
+      id: d.id,
+      title: String(d.data().title || ''),
+      amount: Number(d.data().amount || 0),
+      income_type: String(d.data().income_type || 'other'),
+      cadence: String(d.data().cadence || 'monthly'),
+      next_due_date: String(d.data().next_due_date || todayIso()),
+      received_by: String(d.data().received_by || ''),
+      notes: String(d.data().notes || ''),
+      active: Boolean(d.data().active),
+    }))
+    .sort((a, b) => a.next_due_date.localeCompare(b.next_due_date));
 }
 
 function monthsFromHistory() {
@@ -913,36 +999,73 @@ async function refreshData() {
 }
 
 function setupRealtime() {
-  if (householdChannel) {
-    supabase.removeChannel(householdChannel);
-    householdChannel = null;
-  }
+  unsubscribeFns.forEach((fn) => fn());
+  unsubscribeFns = [];
   if (!state.household) return;
-  const refresh = () => refreshData().catch((error) => showToast(error.message, true));
-  householdChannel = supabase
-    .channel(`household-${state.household.id}`)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'expenses', filter: `household_id=eq.${state.household.id}` }, refresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'incomes', filter: `household_id=eq.${state.household.id}` }, refresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'monthly_budgets', filter: `household_id=eq.${state.household.id}` }, refresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'category_budgets', filter: `household_id=eq.${state.household.id}` }, refresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'recurring_expenses', filter: `household_id=eq.${state.household.id}` }, refresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'recurring_incomes', filter: `household_id=eq.${state.household.id}` }, refresh)
-    .subscribe();
+  const rerender = () => renderAll();
+  const watchCollection = (name, assign) =>
+    onSnapshot(collection(db, 'households', HOUSEHOLD_ID, name), (snap) => {
+      assign(snap);
+      rerender();
+    });
+
+  unsubscribeFns.push(
+    onSnapshot(doc(db, 'households', HOUSEHOLD_ID), (snap) => {
+      const data = snap.data() || {};
+      state.household = { id: HOUSEHOLD_ID, name: String(data.name || 'Our Household') };
+      state.monthlyBudget = Number(data.monthlyBudget || 0);
+      state.members = Object.entries(data.members || {}).map(([user_id, display_name]) => ({ user_id, display_name: String(display_name) }));
+      rerender();
+    }),
+  );
+  unsubscribeFns.push(
+    watchCollection('expenses', (snap) => {
+      state.expenses = snap.docs
+        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
+        .sort((a, b) => `${b.expense_date}-${b.id}`.localeCompare(`${a.expense_date}-${a.id}`));
+    }),
+  );
+  unsubscribeFns.push(
+    watchCollection('incomes', (snap) => {
+      state.incomes = snap.docs
+        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
+        .sort((a, b) => `${b.income_date}-${b.id}`.localeCompare(`${a.income_date}-${a.id}`));
+    }),
+  );
+  unsubscribeFns.push(
+    watchCollection('categoryBudgets', (snap) => {
+      state.categoryBudgets = snap.docs
+        .map((d) => ({ category: String(d.data().category || d.id), amount: Number(d.data().amount || 0) }))
+        .sort((a, b) => a.category.localeCompare(b.category));
+    }),
+  );
+  unsubscribeFns.push(
+    watchCollection('recurringExpenses', (snap) => {
+      state.recurringExpenses = snap.docs
+        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
+        .sort((a, b) => String(a.next_due_date || '').localeCompare(String(b.next_due_date || '')));
+    }),
+  );
+  unsubscribeFns.push(
+    watchCollection('recurringIncomes', (snap) => {
+      state.recurringIncomes = snap.docs
+        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
+        .sort((a, b) => String(a.next_due_date || '').localeCompare(String(b.next_due_date || '')));
+    }),
+  );
 }
 
 async function handleMagicLink(event) {
   event.preventDefault();
   const form = new FormData(event.target);
-  const email = String(form.get('email')).trim().toLowerCase();
+  const email = normalizeEmail(form.get('email'));
   if (!email) throw new Error('Enter your approved email address.');
-  const { error } = await supabase.auth.signInWithOtp({
-    email,
-    options: {
-      shouldCreateUser: true,
-      emailRedirectTo: window.location.origin,
-    },
+  if (!approvedByEmail.has(email)) throw new Error('This email is not approved for this tracker.');
+  await sendSignInLinkToEmail(auth, email, {
+    url: `${window.location.origin}${window.location.pathname}`,
+    handleCodeInApp: true,
   });
-  if (error) throw error;
+  window.localStorage.setItem('expenseTrackerEmailForSignIn', email);
   showToast('Magic link sent. Open it from your email on this device.');
 }
 
@@ -951,9 +1074,11 @@ async function handleDobVerify(event) {
   const form = new FormData(event.target);
   const dob = String(form.get('dob') || '');
   if (!dob) throw new Error('Enter your date of birth.');
-  const { data, error } = await supabase.rpc('verify_access_dob', { p_dob: dob });
-  if (error) throw error;
-  if (!data) throw new Error('DOB does not match the approved profile.');
+  const email = normalizeEmail(state.session?.email);
+  const approved = approvedByEmail.get(email);
+  if (!approved) throw new Error('This email is not approved for this tracker.');
+  const actualHash = await sha256Hex(dob);
+  if (actualHash !== approved.dobHash) throw new Error('DOB does not match the approved profile.');
   state.dobVerified = true;
   await refreshData();
   setupRealtime();
@@ -966,10 +1091,7 @@ async function handleCategoryBudgetSave(event) {
   const category = String(form.get('category'));
   const amount = Number(form.get('amount'));
   if (!category || !Number.isFinite(amount) || amount < 0) throw new Error('Enter a valid category budget.');
-  const { error } = await supabase
-    .from('category_budgets')
-    .upsert({ household_id: state.household.id, category, amount_eur: amount }, { onConflict: 'household_id,category' });
-  if (error) throw error;
+  await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'categoryBudgets', category), { category, amount, updatedAt: Date.now() }, { merge: true });
   await loadBudgets();
   renderWhatIf();
 }
@@ -978,7 +1100,6 @@ async function handleExpenseSave(event) {
   event.preventDefault();
   const form = new FormData(event.target);
   const payload = {
-    household_id: state.household.id,
     amount: Number(form.get('amount')),
     expense_date: String(form.get('expenseDate')),
     category: String(form.get('category')),
@@ -990,13 +1111,11 @@ async function handleExpenseSave(event) {
   };
   if (!Number.isFinite(payload.amount) || payload.amount <= 0) throw new Error('Amount must be greater than zero.');
 
-  let result;
   if (state.editingExpenseId) {
-    result = await supabase.from('expenses').update(payload).eq('id', state.editingExpenseId).eq('household_id', state.household.id);
+    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'expenses', state.editingExpenseId), { ...payload, updatedAt: Date.now() }, { merge: true });
   } else {
-    result = await supabase.from('expenses').insert(payload);
+    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'expenses'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
   }
-  if (result.error) throw result.error;
   await loadExpenses();
   renderDashboard();
   renderExpensesTable();
@@ -1009,7 +1128,6 @@ async function handleIncomeSave(event) {
   event.preventDefault();
   const form = new FormData(event.target);
   const payload = {
-    household_id: state.household.id,
     amount: Number(form.get('amount')),
     income_date: String(form.get('incomeDate')),
     source: String(form.get('source')).trim(),
@@ -1019,13 +1137,11 @@ async function handleIncomeSave(event) {
   };
   if (!Number.isFinite(payload.amount) || payload.amount <= 0 || !payload.source) throw new Error('Enter a valid income record.');
 
-  let result;
   if (state.editingIncomeId) {
-    result = await supabase.from('incomes').update(payload).eq('id', state.editingIncomeId).eq('household_id', state.household.id);
+    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'incomes', state.editingIncomeId), { ...payload, updatedAt: Date.now() }, { merge: true });
   } else {
-    result = await supabase.from('incomes').insert(payload);
+    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'incomes'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
   }
-  if (result.error) throw result.error;
   await loadIncomes();
   renderDashboard();
   renderIncomesTable();
@@ -1037,7 +1153,6 @@ async function handleRecurringExpenseSave(event) {
   event.preventDefault();
   const form = new FormData(event.target);
   const payload = {
-    household_id: state.household.id,
     title: String(form.get('title')).trim(),
     amount: Number(form.get('amount')),
     category: String(form.get('category')),
@@ -1048,17 +1163,11 @@ async function handleRecurringExpenseSave(event) {
   };
   if (!payload.title || !Number.isFinite(payload.amount) || payload.amount <= 0) throw new Error('Enter a valid recurring expense.');
 
-  let result;
   if (state.editingRecurringExpenseId) {
-    result = await supabase
-      .from('recurring_expenses')
-      .update(payload)
-      .eq('id', state.editingRecurringExpenseId)
-      .eq('household_id', state.household.id);
+    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringExpenses', state.editingRecurringExpenseId), { ...payload, updatedAt: Date.now() }, { merge: true });
   } else {
-    result = await supabase.from('recurring_expenses').insert(payload);
+    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringExpenses'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
   }
-  if (result.error) throw result.error;
   await loadRecurring();
   renderRecurringLists();
   renderWhatIf();
@@ -1069,7 +1178,6 @@ async function handleRecurringIncomeSave(event) {
   event.preventDefault();
   const form = new FormData(event.target);
   const payload = {
-    household_id: state.household.id,
     title: String(form.get('title')).trim(),
     amount: Number(form.get('amount')),
     income_type: String(form.get('incomeType')),
@@ -1080,25 +1188,18 @@ async function handleRecurringIncomeSave(event) {
     active: true,
   };
   if (!payload.title || !Number.isFinite(payload.amount) || payload.amount <= 0) throw new Error('Enter a valid recurring income.');
-  let result;
   if (state.editingRecurringIncomeId) {
-    result = await supabase
-      .from('recurring_incomes')
-      .update(payload)
-      .eq('id', state.editingRecurringIncomeId)
-      .eq('household_id', state.household.id);
+    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringIncomes', state.editingRecurringIncomeId), { ...payload, updatedAt: Date.now() }, { merge: true });
   } else {
-    result = await supabase.from('recurring_incomes').insert(payload);
+    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringIncomes'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
   }
-  if (result.error) throw result.error;
   await loadRecurring();
   renderRecurringLists();
   resetRecurringForms();
 }
 
 async function deleteExpense(id) {
-  const { error } = await supabase.from('expenses').delete().eq('id', id).eq('household_id', state.household.id);
-  if (error) throw error;
+  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, 'expenses', id));
   await loadExpenses();
   renderExpensesTable();
   renderDashboard();
@@ -1106,8 +1207,7 @@ async function deleteExpense(id) {
 }
 
 async function deleteIncome(id) {
-  const { error } = await supabase.from('incomes').delete().eq('id', id).eq('household_id', state.household.id);
-  if (error) throw error;
+  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, 'incomes', id));
   await loadIncomes();
   renderIncomesTable();
   renderDashboard();
@@ -1115,24 +1215,23 @@ async function deleteIncome(id) {
 }
 
 async function toggleRecurring(table, id, current) {
-  const { error } = await supabase.from(table).update({ active: !current.active }).eq('id', id).eq('household_id', state.household.id);
-  if (error) throw error;
+  const collectionName = table === 'recurring_expenses' ? 'recurringExpenses' : 'recurringIncomes';
+  await setDoc(doc(db, 'households', HOUSEHOLD_ID, collectionName, id), { active: !current.active, updatedAt: Date.now() }, { merge: true });
   await loadRecurring();
   renderRecurringLists();
   renderWhatIf();
 }
 
 async function deleteRecurring(table, id) {
-  const { error } = await supabase.from(table).delete().eq('id', id).eq('household_id', state.household.id);
-  if (error) throw error;
+  const collectionName = table === 'recurring_expenses' ? 'recurringExpenses' : 'recurringIncomes';
+  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, collectionName, id));
   await loadRecurring();
   renderRecurringLists();
   renderWhatIf();
 }
 
 async function deleteCategoryBudget(category) {
-  const { error } = await supabase.from('category_budgets').delete().eq('household_id', state.household.id).eq('category', category);
-  if (error) throw error;
+  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, 'categoryBudgets', category));
   await loadBudgets();
   renderWhatIf();
 }
@@ -1373,76 +1472,91 @@ async function restoreJson(file) {
   if (!payload || payload.householdId !== state.household.id) throw new Error('Invalid or mismatched backup.');
 
   if (Number.isFinite(Number(payload.monthlyBudget))) {
-    const { error } = await supabase
-      .from('monthly_budgets')
-      .upsert({ household_id: state.household.id, amount_eur: Number(payload.monthlyBudget) }, { onConflict: 'household_id' });
-    if (error) throw error;
+    await setDoc(doc(db, 'households', HOUSEHOLD_ID), { monthlyBudget: Number(payload.monthlyBudget), updatedAt: Date.now() }, { merge: true });
   }
   if (Array.isArray(payload.categoryBudgets) && payload.categoryBudgets.length) {
-    const rows = payload.categoryBudgets.map((x) => ({ household_id: state.household.id, category: x.category, amount_eur: Number(x.amount || 0) }));
-    const { error } = await supabase.from('category_budgets').upsert(rows, { onConflict: 'household_id,category' });
-    if (error) throw error;
+    await Promise.all(
+      payload.categoryBudgets.map((x) =>
+        setDoc(
+          doc(db, 'households', HOUSEHOLD_ID, 'categoryBudgets', String(x.category)),
+          { category: String(x.category), amount: Number(x.amount || 0), updatedAt: Date.now() },
+          { merge: true },
+        ),
+      ),
+    );
   }
   if (Array.isArray(payload.expenses) && payload.expenses.length) {
-    const rows = payload.expenses.map((x) => ({
-      id: x.id,
-      household_id: state.household.id,
-      amount: Number(x.amount),
-      expense_date: String(x.expense_date),
-      category: String(x.category),
-      classification: String(x.classification || 'reducible'),
-      description: String(x.description),
-      paid_by: String(x.paid_by),
-      notes: String(x.notes || ''),
-      is_irregular_annual: Boolean(x.is_irregular_annual),
-    }));
-    const { error } = await supabase.from('expenses').upsert(rows, { onConflict: 'id' });
-    if (error) throw error;
+    await Promise.all(
+      payload.expenses.map((x) => {
+        const row = {
+          amount: Number(x.amount),
+          expense_date: String(x.expense_date),
+          category: String(x.category),
+          classification: String(x.classification || 'reducible'),
+          description: String(x.description),
+          paid_by: String(x.paid_by),
+          notes: String(x.notes || ''),
+          is_irregular_annual: Boolean(x.is_irregular_annual),
+          updatedAt: Date.now(),
+        };
+        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'expenses', String(x.id)), row, { merge: true });
+        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'expenses'), { ...row, createdAt: Date.now() });
+      }),
+    );
   }
   if (Array.isArray(payload.incomes) && payload.incomes.length) {
-    const rows = payload.incomes.map((x) => ({
-      id: x.id,
-      household_id: state.household.id,
-      amount: Number(x.amount),
-      income_date: String(x.income_date),
-      source: String(x.source),
-      income_type: String(x.income_type || 'other'),
-      received_by: String(x.received_by),
-      notes: String(x.notes || ''),
-    }));
-    const { error } = await supabase.from('incomes').upsert(rows, { onConflict: 'id' });
-    if (error) throw error;
+    await Promise.all(
+      payload.incomes.map((x) => {
+        const row = {
+          amount: Number(x.amount),
+          income_date: String(x.income_date),
+          source: String(x.source),
+          income_type: String(x.income_type || 'other'),
+          received_by: String(x.received_by),
+          notes: String(x.notes || ''),
+          updatedAt: Date.now(),
+        };
+        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'incomes', String(x.id)), row, { merge: true });
+        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'incomes'), { ...row, createdAt: Date.now() });
+      }),
+    );
   }
   if (Array.isArray(payload.recurringExpenses) && payload.recurringExpenses.length) {
-    const rows = payload.recurringExpenses.map((x) => ({
-      id: x.id,
-      household_id: state.household.id,
-      title: String(x.title),
-      amount: Number(x.amount),
-      category: String(x.category),
-      cadence: String(x.cadence),
-      next_due_date: String(x.next_due_date),
-      notes: String(x.notes || ''),
-      active: Boolean(x.active),
-    }));
-    const { error } = await supabase.from('recurring_expenses').upsert(rows, { onConflict: 'id' });
-    if (error) throw error;
+    await Promise.all(
+      payload.recurringExpenses.map((x) => {
+        const row = {
+          title: String(x.title),
+          amount: Number(x.amount),
+          category: String(x.category),
+          cadence: String(x.cadence),
+          next_due_date: String(x.next_due_date),
+          notes: String(x.notes || ''),
+          active: Boolean(x.active),
+          updatedAt: Date.now(),
+        };
+        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringExpenses', String(x.id)), row, { merge: true });
+        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringExpenses'), { ...row, createdAt: Date.now() });
+      }),
+    );
   }
   if (Array.isArray(payload.recurringIncomes) && payload.recurringIncomes.length) {
-    const rows = payload.recurringIncomes.map((x) => ({
-      id: x.id,
-      household_id: state.household.id,
-      title: String(x.title),
-      amount: Number(x.amount),
-      income_type: String(x.income_type),
-      cadence: String(x.cadence),
-      next_due_date: String(x.next_due_date),
-      received_by: String(x.received_by),
-      notes: String(x.notes || ''),
-      active: Boolean(x.active),
-    }));
-    const { error } = await supabase.from('recurring_incomes').upsert(rows, { onConflict: 'id' });
-    if (error) throw error;
+    await Promise.all(
+      payload.recurringIncomes.map((x) => {
+        const row = {
+          title: String(x.title),
+          amount: Number(x.amount),
+          income_type: String(x.income_type),
+          cadence: String(x.cadence),
+          next_due_date: String(x.next_due_date),
+          received_by: String(x.received_by),
+          notes: String(x.notes || ''),
+          active: Boolean(x.active),
+          updatedAt: Date.now(),
+        };
+        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringIncomes', String(x.id)), row, { merge: true });
+        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringIncomes'), { ...row, createdAt: Date.now() });
+      }),
+    );
   }
 }
 
@@ -1526,29 +1640,25 @@ function bindEvents() {
     }
   });
   document.querySelector('#signOutButton').addEventListener('click', () => {
-    supabase.auth.signOut().catch((err) => showToast(err.message, true));
+    signOut(auth).catch((err) => showToast(err.message, true));
   });
 
   bindScenarioEvents();
 }
 
 async function applySession(session) {
-  const sameUser = Boolean(state.session?.user?.id && session?.user?.id && state.session.user.id === session.user.id);
+  const sameUser = Boolean(state.session?.uid && session?.uid && state.session.uid === session.uid);
   state.session = session;
   if (!session) {
     state.dobVerified = false;
     state.profile = null;
     state.household = null;
-    if (householdChannel) {
-      supabase.removeChannel(householdChannel);
-      householdChannel = null;
-    }
+    unsubscribeFns.forEach((fn) => fn());
+    unsubscribeFns = [];
     setVisibleView('#authView');
     return;
   }
   await loadProfile();
-  const { error: bootstrapError } = await supabase.rpc('bootstrap_household_for_authorized_user', { p_household_name: 'Our Household' });
-  if (bootstrapError) throw bootstrapError;
   await loadHousehold();
   if (!state.household) throw new Error('No household linked to this account.');
   if (!sameUser) state.dobVerified = false;
@@ -1563,19 +1673,36 @@ async function applySession(session) {
 
 async function main() {
   renderShell();
-  if (!ensureSupabaseConfigured()) return;
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  if (!ensureFirebaseConfigured()) return;
+  approvedUsers = parseApprovedUsers();
+  approvedByEmail = new Map(approvedUsers.map((x) => [x.email, x]));
+  if (!approvedUsers.length) {
+    throw new Error('No approved users configured. Set VITE_APPROVED_USERS_JSON in .env.local');
+  }
+  const app = initializeApp({
+    apiKey: FIREBASE_API_KEY,
+    authDomain: FIREBASE_AUTH_DOMAIN,
+    projectId: FIREBASE_PROJECT_ID,
+    appId: FIREBASE_APP_ID,
+  });
+  auth = getAuth(app);
+  db = getFirestore(app);
   bindEvents();
-  const { data, error } = await supabase.auth.getSession();
-  if (error) throw error;
-  await applySession(data.session);
+
+  if (isSignInWithEmailLink(auth, window.location.href)) {
+    const email = normalizeEmail(window.localStorage.getItem('expenseTrackerEmailForSignIn'));
+    if (!email) throw new Error('Missing sign-in email on this device. Request a new magic link.');
+    await signInWithEmailLink(auth, email, window.location.href);
+    window.localStorage.removeItem('expenseTrackerEmailForSignIn');
+    window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.search}`);
+  }
+
+  await applySession(auth.currentUser);
   document.querySelector('#expenseForm input[name="expenseDate"]').value = todayIso();
   document.querySelector('#incomeForm input[name="incomeDate"]').value = todayIso();
   document.querySelector('#recurringExpenseForm input[name="nextDueDate"]').value = todayIso();
   document.querySelector('#recurringIncomeForm input[name="nextDueDate"]').value = todayIso();
-  supabase.auth.onAuthStateChange((_event, session) => {
-    applySession(session).catch((err) => showToast(err.message, true));
-  });
+  onAuthStateChanged(auth, (session) => applySession(session).catch((err) => showToast(err.message, true)));
 }
 
 main().catch((error) => showToast(error.message, true));

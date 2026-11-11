@@ -1,113 +1,72 @@
 # Household Expense Tracker
 
-A mobile-friendly shared household expense tracker for two authenticated users, built as a static frontend with Supabase authentication + Postgres + Row Level Security (RLS).
+Private household finance tracker for two people, hosted on **GitHub Pages** with **Firebase Auth + Firestore**.
 
-## Why this architecture
+## Why this setup
 
-This project uses a static JavaScript frontend and Supabase backend instead of Node.js/Spring because it is the simplest maintainable option that still gives:
-
-- Separate sign-in per person (email magic link)
-- Shared real-time-ish cloud data
-- Strong database-level access controls (RLS)
-- No custom backend server to maintain
+- Public website URL on GitHub Pages
+- Secure sign-in with email magic link
+- Firestore security rules restrict data access to only two approved emails
+- Real-time sync between both users' devices
 
 ## Features
 
-- Fast expense entry with category + classification (`essential`, `reducible`, `optional`)
-- Income tracking (salary/other), including one-off and recurring income
-- Recurring expenses (mortgage, electricity, broadband, subscriptions, etc.)
-- Dashboard-first view:
-  - total monthly income and expenses
-  - essential/reducible/optional monthly totals
-  - monthly surplus/shortfall
-  - category/classification/person breakdowns
-  - income and expense trends
-- "What If?" planner:
-  - both incomes, one-income, or custom income scenarios
-  - optional spending reduction simulation
-  - projected surplus/shortfall
-- Budget discovery from actual history:
-  - average monthly spending
-  - minimum essential monthly spending
-  - average optional spending
-  - irregular annual expenses converted to monthly equivalents
-  - suggested monthly target
-- Optional category budgets
-- EUR formatting with Ireland locale (`en-IE`)
-- CSV and Excel export
-- Backup and restore via JSON
+- Expense tracking: add/edit/delete/search/filter
+- Income tracking (salary/other)
+- Essential/reducible/optional classification
+- Dashboard with monthly totals, breakdowns, trends, and surplus/shortfall
+- "What If?" one-income planner
+- Recurring income and recurring expenses
+- Category budgets
+- EUR formatting (`en-IE`)
+- CSV/Excel export + JSON backup/restore
 
-## Stack
+## Local setup
 
-- Vite + Vanilla JavaScript + CSS
-- Supabase Auth + Postgres + RLS
-
-## Setup
-
-1. Create a Supabase project.
-2. In Supabase SQL editor, run `supabase/schema.sql`.
-3. In Supabase Auth settings:
-   - Enable **Email** provider (magic link / OTP).
-   - Disable unused providers if desired.
-4. Copy `.env.example` to `.env.local` and fill:
-
-```bash
-VITE_SUPABASE_URL=...
-VITE_SUPABASE_ANON_KEY=...
-```
-
-5. Install and run:
+1. Create a Firebase project.
+2. Enable **Authentication → Email link (passwordless sign-in)**.
+3. Create Firestore database (production mode).
+4. In Firestore rules, paste `firebase/firestore.rules` and replace the two placeholder emails.
+5. Copy `.env.example` to `.env.local` and fill Firebase values.
+6. Set `VITE_APPROVED_USERS_JSON` with your two approved users and DOB hashes.
+7. Run:
 
 ```bash
 npm install
 npm run dev
 ```
 
-6. In Supabase SQL editor, register exactly two approved users (replace values):
+## How to generate DOB hashes (SHA-256)
 
-```sql
-insert into public.authorized_users (email, display_name, dob_hash)
-values
-  ('you@example.com', 'Your Name', encode(digest('1990-01-31', 'sha256'), 'hex')),
-  ('husband@example.com', 'Husband Name', encode(digest('1989-06-12', 'sha256'), 'hex'))
-on conflict (email) do update
-set display_name = excluded.display_name,
-    dob_hash = excluded.dob_hash;
+Use format `YYYY-MM-DD` for DOB, then hash it:
+
+```bash
+node -e "const c=require('crypto'); console.log(c.createHash('sha256').update('1990-01-31').digest('hex'))"
 ```
 
-7. Open the app:
-   - Enter one approved email and request a magic link.
-   - Open the magic link from email.
-   - Enter DOB to unlock the dashboard.
+Put that hash into `VITE_APPROVED_USERS_JSON`.
+
+## GitHub Pages deploy
+
+This repo includes `.github/workflows/deploy-pages.yml`.
+
+1. In GitHub repo settings, enable **Pages → Source: GitHub Actions**.
+2. Add repository secrets:
+   - `VITE_FIREBASE_API_KEY`
+   - `VITE_FIREBASE_AUTH_DOMAIN`
+   - `VITE_FIREBASE_PROJECT_ID`
+   - `VITE_FIREBASE_APP_ID`
+   - `VITE_HOUSEHOLD_ID`
+   - `VITE_APPROVED_USERS_JSON`
+3. Push to `master`.
+
+Site URL format:
+
+`https://ranjana7.github.io/household-expense-tracker/`
 
 ## Security model
 
-- App access requires sign-in via email magic link.
-- Only emails listed in `public.authorized_users` can create sessions.
-- Supabase RLS policies enforce that only household members can read/write household incomes, expenses, recurring items, and budgets.
-- Data isolation is enforced in database policies, not hidden frontend routes.
-- Bootstrap flow enforces max two authorized household members.
-- No service-role keys are used in frontend.
-
-## Backup/restore
-
-- **Backup JSON** exports incomes, expenses, recurring data, and budgets.
-- **Restore JSON** validates household ID and upserts records.
-- **Export CSV/Excel** gives spreadsheet-friendly copies.
-
-## Deploy (private repo + free host)
-
-Recommended: Netlify (free) connected to private GitHub repo.
-
-- Build command: `npm run build`
-- Publish directory: `dist`
-- Environment variables:
-  - `VITE_SUPABASE_URL`
-  - `VITE_SUPABASE_ANON_KEY`
-
-## Free-tier limits (typical)
-
-- **Supabase Free**: limited database size, auth quotas, and inactivity pausing.
-- **Netlify Free**: limited monthly bandwidth/build minutes and project usage caps.
-
-Check your provider dashboard for current exact quotas.
+- Sign-in required (magic link).
+- Firestore rules enforce server-side email allow-list access.
+- Only the two approved emails can read/write household data.
+- No API secrets are committed in the repository.
