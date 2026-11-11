@@ -4,7 +4,6 @@ import './style.css';
 const STORAGE_KEY = 'household-finance-local-v3';
 const SESSION_UNLOCK_KEY = 'household-finance-session-v3';
 const SYNC_API_BASE = import.meta.env.VITE_SYNC_API_BASE_URL || '';
-const APPROVED_NAMES = ['ranjana', 'ranjana garg', 'ak', 'ak sharma'];
 const LOCALE = 'en-IE';
 const CURRENCY = 'EUR';
 const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
@@ -607,6 +606,7 @@ function renderShell() {
           <label>Name <input name="name" required maxlength="60" /></label>
           <label>Date of birth <input name="dob" type="date" required /></label>
           <p class="muted">Expected DOB value: today's date.</p>
+          <button id="useTodayButton" class="secondary" type="button">Use today's date</button>
           <button type="submit">Enter</button>
         </form>
       </section>
@@ -722,9 +722,8 @@ function bindEvents() {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
     const nameRaw = String(fd.get('name') || '').trim();
-    const name = nameRaw.toLowerCase();
     const dob = String(fd.get('dob') || '').trim();
-    if (!APPROVED_NAMES.includes(name)) return showToast('Name is not approved.', true);
+    if (!nameRaw) return showToast('Please enter your name.', true);
     if (dob !== todayIso()) return showToast("DOB must match today's date.", true);
     state.user = nameRaw;
     state.unlocked = true;
@@ -735,6 +734,9 @@ function bindEvents() {
     renderExpenseCategoryList();
     renderAll();
     startPolling();
+  });
+  document.querySelector('#useTodayButton').addEventListener('click', () => {
+    document.querySelector('#unlockForm input[name="dob"]').value = todayIso();
   });
 
   document.querySelector('#lockButton').addEventListener('click', () => {
