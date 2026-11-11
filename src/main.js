@@ -6,7 +6,11 @@ const SESSION_UNLOCK_KEY = 'household-finance-session-v3';
 const SYNC_API_BASE = import.meta.env.VITE_SYNC_API_BASE_URL || '';
 const LOCALE = 'en-IE';
 const CURRENCY = 'EUR';
-const PLAYFUL_ENTRY_NAME = 'WhatIf';
+const ALLOWED_SESSION_NAMES = new Set(['Amit', 'Ranjana']);
+const ALLOWED_NAME_HASHES = new Set([
+  '105a112c81ce60e646c007e98655b7caa27d9e6f36a7ba9584e406dd400e15ff',
+  'a13e93f0c837098185bc6189f34f9975910089c0d2af201b47bb4514cb905e23',
+]);
 const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
 const EXPENSE_TYPES = ['mandatory', 'avoidable'];
 const INCOME_TYPES = ['permanent', 'temporary'];
@@ -32,7 +36,11 @@ const state = {
 };
 
 function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function todayMonth() {
@@ -63,6 +71,19 @@ function formatCurrency(value) {
 
 function formatDate(value) {
   return new Intl.DateTimeFormat(LOCALE).format(new Date(`${value}T00:00:00`));
+}
+
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function isAllowedName(name) {
+  const hash = await sha256Hex(name);
+  return ALLOWED_NAME_HASHES.has(hash);
 }
 
 function showToast(message, isError = false) {
@@ -602,13 +623,9 @@ function renderShell() {
 
       <section id="gateView" class="card">
         <h1>Household Finance Tracker</h1>
-        <p class="muted">Playful welcome screen (not security/authentication).</p>
         <form id="unlockForm" class="stack">
           <label>Name <input name="name" required maxlength="60" /></label>
           <label>Date of birth <input name="dob" type="date" required /></label>
-          <p class="muted">Name must be exactly: ${PLAYFUL_ENTRY_NAME}</p>
-          <p class="muted">Expected DOB value: today's date.</p>
-          <button id="useTodayButton" class="secondary" type="button">Use today's date</button>
           <button type="submit">Enter</button>
         </form>
       </section>
@@ -720,14 +737,15 @@ function renderExpenseCategoryList() {
 }
 
 function bindEvents() {
-  document.querySelector('#unlockForm').addEventListener('submit', (e) => {
+  document.querySelector('#unlockForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
     const nameRaw = String(fd.get('name') || '').trim();
     const dob = String(fd.get('dob') || '').trim();
-    if (!nameRaw) return showToast('Please enter your name.', true);
-    if (nameRaw !== PLAYFUL_ENTRY_NAME) return showToast(`Name must be exactly ${PLAYFUL_ENTRY_NAME}.`, true);
-    if (dob !== todayIso()) return showToast("DOB must match today's date.", true);
+    if (!nameRaw || !(await isAllowedName(nameRaw)) || dob !== todayIso()) {
+      showToast('Access denied.', true);
+      return;
+    }
     state.user = nameRaw;
     state.unlocked = true;
     sessionStorage.setItem(SESSION_UNLOCK_KEY, JSON.stringify({ user: state.user, ts: Date.now() }));
@@ -737,9 +755,6 @@ function bindEvents() {
     renderExpenseCategoryList();
     renderAll();
     startPolling();
-  });
-  document.querySelector('#useTodayButton').addEventListener('click', () => {
-    document.querySelector('#unlockForm input[name="dob"]').value = todayIso();
   });
 
   document.querySelector('#lockButton').addEventListener('click', () => {
@@ -844,7 +859,7 @@ async function main() {
   await loadData();
 
   const session = loadJson(SESSION_UNLOCK_KEY, null);
-  if (session?.user) {
+  if (session?.user && ALLOWED_SESSION_NAMES.has(String(session.user))) {
     state.user = String(session.user);
     state.unlocked = true;
     setVisibleView('#appView');
