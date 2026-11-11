@@ -1,18 +1,54 @@
-# Household Expense Tracker (Simple Public App)
+# Household Finance Tracker (GitHub Pages only)
 
-A lightweight household expense tracker hosted on GitHub Pages.
+Simple household income/expense tracker with four tabs:
+- Dashboard
+- Transactions
+- Financial Groups
+- What If?
 
-## What this version is
+## Plain data/storage facts
 
-- Public static website (no external backend service)
-- Data saved in your browser (`localStorage`)
-- Name + DOB popup gate for basic access friction
-- Budget tracking, dashboard cards, filters, edit/delete, CSV/Excel export, JSON backup/restore
+- This app is hosted as static files on GitHub Pages.
+- **Entries are saved in browser local storage on each device**.
+- It does **not** auto-sync between devices.
+- Your data is **not** committed to the repository unless you manually export and commit it.
+- Use **Backup JSON** and **Restore JSON** to move/recover data.
 
-## Important limitation
+## Access screen
 
-This is **not secure authentication**.  
-Because this app is fully client-side/public, name + DOB checks can be bypassed by technical users.
+- Playful entry screen asks for name and "DOB".
+- Expected DOB is today's date.
+- This is **not security/authentication**.
+
+## Features
+
+- Two quick actions: **Add Income** and **Add Expense**
+- Entry fields:
+  - amount
+  - date
+  - category
+  - frequency
+  - optional note/description
+  - optional financial group
+- Frequencies:
+  - one-time
+  - weekly
+  - monthly
+  - quarterly
+  - yearly
+  - custom-months (for irregular month-specific income/expense)
+- Start/end dates for recurring entries
+- Financial groups to link items (for example rental income + mortgage + maintenance)
+- Expense classes: mandatory, reducible, optional
+- Separate:
+  - **Actual cash flow** (when money really arrives/leaves)
+  - **Normalised monthly view** (planning averages)
+- What-if planner:
+  - remove income streams
+  - override income values
+  - reduce optional expenses
+  - see monthly/annual surplus/shortfall without changing stored entries
+- CSV/Excel export and JSON backup/restore
 
 ## Run locally
 
@@ -23,20 +59,9 @@ npm run dev
 
 ## Deploy to GitHub Pages
 
-The workflow `.github/workflows/deploy-pages.yml` deploys automatically on push to `master`.
+This repo includes `.github/workflows/deploy-pages.yml`.
 
-1. GitHub repo settings → **Pages** → Source = **GitHub Actions**
+1. GitHub repo settings -> Pages -> Source = GitHub Actions
 2. Push to `master`
-3. Site URL:
+3. Live URL:
    `https://ranjana7.github.io/household-expense-tracker/`
-
-## Access popup logic
-
-1. Enter one approved name (`Ranjana`/`Ranjana Garg` or `AK`/`AK Sharma`)
-2. In DOB field, enter **today's date**
-3. The app unlocks only when both checks match
-
-## Data notes
-
-- Data is stored per browser/device profile.
-- Use **Backup JSON** and **Restore JSON** to move data between devices.
