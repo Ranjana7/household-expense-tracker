@@ -6,6 +6,7 @@ const SESSION_UNLOCK_KEY = 'household-finance-session-v3';
 const SYNC_API_BASE = import.meta.env.VITE_SYNC_API_BASE_URL || '';
 const LOCALE = 'en-IE';
 const CURRENCY = 'EUR';
+const PLAYFUL_ENTRY_NAME = 'WhatIf';
 const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
 const EXPENSE_TYPES = ['mandatory', 'avoidable'];
 const INCOME_TYPES = ['permanent', 'temporary'];
@@ -605,6 +606,7 @@ function renderShell() {
         <form id="unlockForm" class="stack">
           <label>Name <input name="name" required maxlength="60" /></label>
           <label>Date of birth <input name="dob" type="date" required /></label>
+          <p class="muted">Name must be exactly: ${PLAYFUL_ENTRY_NAME}</p>
           <p class="muted">Expected DOB value: today's date.</p>
           <button id="useTodayButton" class="secondary" type="button">Use today's date</button>
           <button type="submit">Enter</button>
@@ -724,6 +726,7 @@ function bindEvents() {
     const nameRaw = String(fd.get('name') || '').trim();
     const dob = String(fd.get('dob') || '').trim();
     if (!nameRaw) return showToast('Please enter your name.', true);
+    if (nameRaw !== PLAYFUL_ENTRY_NAME) return showToast(`Name must be exactly ${PLAYFUL_ENTRY_NAME}.`, true);
     if (dob !== todayIso()) return showToast("DOB must match today's date.", true);
     state.user = nameRaw;
     state.unlocked = true;
