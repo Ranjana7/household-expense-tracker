@@ -1,204 +1,116 @@
-import { initializeApp } from 'firebase/app';
-import {
-  getAuth,
-  onAuthStateChanged,
-  sendSignInLinkToEmail,
-  isSignInWithEmailLink,
-  signInWithEmailLink,
-  signOut,
-} from 'firebase/auth';
-import {
-  getFirestore,
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  addDoc,
-  getDocs,
-  collection,
-  onSnapshot,
-} from 'firebase/firestore';
 import { utils, writeFileXLSX } from 'xlsx';
 import './style.css';
 
-const FIREBASE_API_KEY = import.meta.env.VITE_FIREBASE_API_KEY;
-const FIREBASE_AUTH_DOMAIN = import.meta.env.VITE_FIREBASE_AUTH_DOMAIN;
-const FIREBASE_PROJECT_ID = import.meta.env.VITE_FIREBASE_PROJECT_ID;
-const FIREBASE_APP_ID = import.meta.env.VITE_FIREBASE_APP_ID;
-const HOUSEHOLD_ID = import.meta.env.VITE_HOUSEHOLD_ID || 'main-household';
-const APPROVED_USERS_JSON = import.meta.env.VITE_APPROVED_USERS_JSON || '[]';
+const STORAGE_KEY = 'household-public-expense-tracker-v1';
+const SESSION_UNLOCK_KEY = 'household-public-access-session-v1';
+const APPROVED_NAMES = ['ranjana', 'ranjana garg', 'ak', 'ak sharma'];
+const LOCALE = 'en-IE';
+const CURRENCY = 'EUR';
 const CATEGORY_OPTIONS = ['Groceries', 'Utilities', 'Transport', 'Dining', 'Health', 'Shopping', 'Home', 'Kids', 'Mortgage', 'Insurance', 'Subscriptions', 'Other'];
-const EXPENSE_CLASSIFICATIONS = [
+const CLASSIFICATIONS = [
   { value: 'essential', label: 'Essential' },
   { value: 'reducible', label: 'Reducible' },
   { value: 'optional', label: 'Optional' },
 ];
-const INCOME_TYPES = ['salary', 'other'];
-const CADENCE_OPTIONS = ['weekly', 'monthly', 'yearly'];
-const LOCALE = 'en-IE';
-const CURRENCY = 'EUR';
 
 const state = {
-  session: null,
-  dobVerified: false,
-  profile: null,
-  household: null,
-  members: [],
-  expenses: [],
-  incomes: [],
-  recurringExpenses: [],
-  recurringIncomes: [],
+  user: '',
+  unlocked: false,
   monthlyBudget: 0,
-  categoryBudgets: [],
-  editingExpenseId: null,
-  editingIncomeId: null,
-  editingRecurringExpenseId: null,
-  editingRecurringIncomeId: null,
+  expenses: [],
   filters: { search: '', category: '', paidBy: '', month: '' },
-  scenario: {
-    mode: 'both',
-    selectedMemberA: '',
-    selectedMemberB: '',
-    customIncome: 0,
-    optionalReductionPercent: 0,
-  },
+  editingId: null,
 };
 
-let db = null;
-let auth = null;
-let unsubscribeFns = [];
-let approvedUsers = [];
-let approvedByEmail = new Map();
+function loadJson(key, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    if (!value) return fallback;
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ monthlyBudget: state.monthlyBudget, expenses: state.expenses }));
+}
+
+function formatCurrency(value) {
+  return new Intl.NumberFormat(LOCALE, { style: 'currency', currency: CURRENCY }).format(Number(value || 0));
+}
+
+function formatDate(value) {
+  return new Intl.DateTimeFormat(LOCALE).format(new Date(`${value}T00:00:00`));
+}
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function monthKey(value) {
+  return String(value).slice(0, 7);
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
 
 function renderShell() {
   document.querySelector('#app').innerHTML = `
     <main class="container">
-      <section id="configError" class="card danger hidden"></section>
       <section id="toast" class="card hidden"></section>
 
-      <section id="authView" class="card">
+      <section id="gateView" class="card">
         <h1>Household Expense Tracker</h1>
-        <p class="muted">Private household tracker for two approved users. Sign in with your approved email to receive a one-time magic link.</p>
-        <form id="magicLinkForm" class="stack">
-          <label>Approved email<input name="email" type="email" required autocomplete="email" /></label>
-          <button type="submit">Send magic link</button>
+        <p class="muted">Simple public app hosted on GitHub Pages. Access popup asks for name and DOB.</p>
+        <form id="unlockForm" class="stack">
+          <h3>Open tracker</h3>
+          <label>Name
+            <input name="name" required maxlength="60" />
+          </label>
+          <label>Date of birth
+            <input name="dob" type="date" required />
+          </label>
+          <p class="muted">Hint: for this setup, enter today's date in DOB.</p>
+          <button type="submit">Enter</button>
         </form>
-      </section>
-
-      <section id="dobView" class="hidden">
-        <div class="card">
-          <h2>Confirm date of birth</h2>
-          <p class="muted">Enter your DOB to open the household dashboard.</p>
-          <form id="dobForm" class="stack">
-            <label>Date of birth<input name="dob" type="date" required /></label>
-            <button type="submit">Continue</button>
-          </form>
-        </div>
       </section>
 
       <section id="appView" class="hidden">
         <div class="card topbar">
           <div>
-            <h2 id="householdTitle"></h2>
-            <p class="muted">Signed in as <strong id="signedInName"></strong></p>
+            <h2>Household dashboard</h2>
+            <p class="muted">Opened by <strong id="signedInName"></strong></p>
           </div>
-          <button id="signOutButton" class="secondary">Sign out</button>
+          <button id="lockButton" class="secondary">Lock</button>
         </div>
 
         <section class="card">
-          <h3>Financial dashboard</h3>
-          <div class="grid cards5">
-            <article class="card stat"><p class="muted">Monthly household income</p><h3 id="monthlyIncomeCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Monthly household expenses</p><h3 id="monthlyExpenseCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Essential monthly expenses</p><h3 id="monthlyEssentialCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Reducible monthly expenses</p><h3 id="monthlyReducibleCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Optional monthly expenses</p><h3 id="monthlyOptionalCard">€0.00</h3></article>
-          </div>
           <div class="grid cards4">
-            <article class="card stat"><p class="muted">Monthly surplus / shortfall</p><h3 id="monthlySurplusCard">€0.00</h3></article>
+            <article class="card stat"><p class="muted">This month spend</p><h3 id="monthSpendCard">€0.00</h3></article>
             <article class="card stat"><p class="muted">This week spend</p><h3 id="weekSpendCard">€0.00</h3></article>
             <article class="card stat"><p class="muted">This year spend</p><h3 id="yearSpendCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Upcoming recurring (30d)</p><h3 id="upcomingRecurringCount">0</h3></article>
+            <article class="card stat"><p class="muted">Monthly budget</p><h3 id="budgetCard">€0.00</h3></article>
           </div>
+          <div class="progress"><span id="budgetFill"></span></div>
+          <p id="budgetStatus" class="muted"></p>
+          <form id="budgetForm" class="inline-form">
+            <label>Monthly budget (EUR)<input name="budget" type="number" min="0" step="0.01" required /></label>
+            <button type="submit">Save budget</button>
+          </form>
         </section>
 
         <div class="grid cards3">
           <section class="card"><h3>Spending by category</h3><div id="categoryBreakdown" class="bars"></div></section>
-          <section class="card"><h3>Spending by classification</h3><div id="classificationBreakdown" class="bars"></div></section>
           <section class="card"><h3>Spending by person</h3><div id="personBreakdown" class="bars"></div></section>
+          <section class="card"><h3>Monthly trend (6 months)</h3><div id="trendBreakdown" class="bars"></div></section>
         </div>
-
-        <div class="grid cards2">
-          <section class="card"><h3>Monthly expense trend (12 months)</h3><div id="monthlyExpenseTrend" class="bars"></div></section>
-          <section class="card"><h3>Monthly income trend (12 months)</h3><div id="monthlyIncomeTrend" class="bars"></div></section>
-        </div>
-
-        <section class="card">
-          <h3>What If? (one-income scenario planner)</h3>
-          <div class="grid scenario-grid">
-            <label>Scenario
-              <select id="scenarioMode">
-                <option value="both">Both incomes continuing</option>
-                <option value="member-a">Only one member income</option>
-                <option value="member-b">Only the other member income</option>
-                <option value="custom">Custom household income</option>
-              </select>
-            </label>
-            <label>Member A
-              <select id="scenarioMemberA"></select>
-            </label>
-            <label>Member B
-              <select id="scenarioMemberB"></select>
-            </label>
-            <label>Custom monthly income (EUR)
-              <input id="scenarioCustomIncome" type="number" min="0" step="0.01" value="0" />
-            </label>
-            <label>Optional expense reduction %
-              <input id="scenarioOptionalReduction" type="range" min="0" max="100" value="0" />
-            </label>
-            <p class="muted" id="scenarioOptionalReductionLabel">0%</p>
-          </div>
-          <div class="grid cards5">
-            <article class="card stat"><p class="muted">Available monthly income</p><h3 id="scenarioIncomeCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Essential expenses</p><h3 id="scenarioEssentialCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Current lifestyle expenses</p><h3 id="scenarioLifestyleCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Potential optional savings</p><h3 id="scenarioSavingsCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Projected surplus / shortfall</p><h3 id="scenarioSurplusCard">€0.00</h3></article>
-          </div>
-        </section>
-
-        <section class="card">
-          <h3>Discover household budget (from actual data)</h3>
-          <div class="grid cards5">
-            <article class="card stat"><p class="muted">Average monthly spending (actual)</p><h3 id="avgMonthlySpendingCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Minimum essential monthly spending</p><h3 id="minEssentialCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Average optional spending</p><h3 id="avgOptionalCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Irregular annual expenses / month</p><h3 id="annualEquivalentCard">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Suggested monthly target</p><h3 id="suggestedTargetCard">€0.00</h3></article>
-          </div>
-          <p class="muted">Actual values come from recorded entries. Suggested targets are estimates based on your history.</p>
-        </section>
-
-        <section class="card">
-          <h3>Annual irregular expenses view</h3>
-          <p class="muted">Use this for holidays, insurance renewals, Christmas, school costs, and other non-monthly costs.</p>
-          <div id="annualExpenseList" class="simple-list"></div>
-        </section>
-
-        <section class="card">
-          <h3>Category monthly budgets (optional)</h3>
-          <form id="categoryBudgetForm" class="inline-form">
-            <label>Category
-              <select name="category" required>
-                ${CATEGORY_OPTIONS.map((category) => `<option value="${category}">${category}</option>`).join('')}
-              </select>
-            </label>
-            <label>Budget (EUR)<input name="amount" type="number" min="0" step="0.01" required /></label>
-            <button type="submit">Save category budget</button>
-          </form>
-          <div id="categoryBudgetList" class="simple-list"></div>
-        </section>
 
         <section class="card">
           <h3 id="expenseFormTitle">Quick expense entry</h3>
@@ -207,101 +119,23 @@ function renderShell() {
             <label>Date<input name="expenseDate" type="date" required /></label>
             <label>Category
               <select name="category" required>
-                ${CATEGORY_OPTIONS.map((category) => `<option value="${category}">${category}</option>`).join('')}
+                ${CATEGORY_OPTIONS.map((x) => `<option value="${x}">${x}</option>`).join('')}
               </select>
             </label>
             <label>Classification
               <select name="classification" required>
-                ${EXPENSE_CLASSIFICATIONS.map((item) => `<option value="${item.value}">${item.label}</option>`).join('')}
+                ${CLASSIFICATIONS.map((x) => `<option value="${x.value}">${x.label}</option>`).join('')}
               </select>
             </label>
             <label>Description<input name="description" required maxlength="120" /></label>
-            <label>Who paid
-              <select name="paidBy" id="paidBySelect" required></select>
-            </label>
-            <label class="checkbox-inline"><input type="checkbox" name="isIrregularAnnual" /> Mark as irregular annual expense</label>
-            <label class="wide">Optional notes<textarea name="notes" maxlength="500"></textarea></label>
+            <label>Who paid<input name="paidBy" required maxlength="60" /></label>
+            <label class="wide">Notes<textarea name="notes" maxlength="500"></textarea></label>
             <div class="actions">
               <button type="submit" id="saveExpenseButton">Add expense</button>
-              <button type="button" id="cancelExpenseEditButton" class="secondary hidden">Cancel edit</button>
+              <button type="button" id="cancelEditButton" class="secondary hidden">Cancel edit</button>
             </div>
           </form>
         </section>
-
-        <section class="card">
-          <h3 id="incomeFormTitle">Income entry</h3>
-          <form id="incomeForm" class="grid-form">
-            <label>Amount (EUR)<input name="amount" type="number" step="0.01" min="0.01" required /></label>
-            <label>Date<input name="incomeDate" type="date" required /></label>
-            <label>Source<input name="source" required maxlength="80" placeholder="Salary, bonus, freelance..." /></label>
-            <label>Type
-              <select name="incomeType" required>
-                ${INCOME_TYPES.map((item) => `<option value="${item}">${item}</option>`).join('')}
-              </select>
-            </label>
-            <label>Received by
-              <select name="receivedBy" id="receivedBySelect" required></select>
-            </label>
-            <label class="wide">Optional notes<textarea name="notes" maxlength="300"></textarea></label>
-            <div class="actions">
-              <button type="submit" id="saveIncomeButton">Add income</button>
-              <button type="button" id="cancelIncomeEditButton" class="secondary hidden">Cancel edit</button>
-            </div>
-          </form>
-        </section>
-
-        <div class="grid cards2">
-          <section class="card">
-            <h3 id="recurringExpenseFormTitle">Recurring expenses</h3>
-            <form id="recurringExpenseForm" class="grid-form">
-              <label>Title<input name="title" required maxlength="80" /></label>
-              <label>Amount (EUR)<input name="amount" type="number" step="0.01" min="0.01" required /></label>
-              <label>Category
-                <select name="category" required>
-                  ${CATEGORY_OPTIONS.map((category) => `<option value="${category}">${category}</option>`).join('')}
-                </select>
-              </label>
-              <label>Cadence
-                <select name="cadence" required>
-                  ${CADENCE_OPTIONS.map((cadence) => `<option value="${cadence}">${cadence}</option>`).join('')}
-                </select>
-              </label>
-              <label>Next due<input name="nextDueDate" type="date" required /></label>
-              <label class="wide">Notes<textarea name="notes" maxlength="300"></textarea></label>
-              <div class="actions">
-                <button type="submit" id="saveRecurringExpenseButton">Add recurring expense</button>
-                <button type="button" id="cancelRecurringExpenseEditButton" class="secondary hidden">Cancel edit</button>
-              </div>
-            </form>
-            <div id="recurringExpenseList" class="simple-list"></div>
-          </section>
-
-          <section class="card">
-            <h3 id="recurringIncomeFormTitle">Recurring incomes</h3>
-            <form id="recurringIncomeForm" class="grid-form">
-              <label>Title<input name="title" required maxlength="80" /></label>
-              <label>Amount (EUR)<input name="amount" type="number" step="0.01" min="0.01" required /></label>
-              <label>Type
-                <select name="incomeType" required>
-                  ${INCOME_TYPES.map((item) => `<option value="${item}">${item}</option>`).join('')}
-                </select>
-              </label>
-              <label>Cadence
-                <select name="cadence" required>
-                  ${CADENCE_OPTIONS.map((cadence) => `<option value="${cadence}">${cadence}</option>`).join('')}
-                </select>
-              </label>
-              <label>Next expected<input name="nextDueDate" type="date" required /></label>
-              <label>Received by<select name="receivedBy" id="recurringIncomeReceivedBy" required></select></label>
-              <label class="wide">Notes<textarea name="notes" maxlength="300"></textarea></label>
-              <div class="actions">
-                <button type="submit" id="saveRecurringIncomeButton">Add recurring income</button>
-                <button type="button" id="cancelRecurringIncomeEditButton" class="secondary hidden">Cancel edit</button>
-              </div>
-            </form>
-            <div id="recurringIncomeList" class="simple-list"></div>
-          </section>
-        </div>
 
         <section class="card">
           <div class="section-head">
@@ -314,16 +148,14 @@ function renderShell() {
             </div>
           </div>
           <form id="filterForm" class="filters">
-            <label>Search<input name="search" placeholder="description, notes, source..." /></label>
+            <label>Search<input name="search" placeholder="description or notes..." /></label>
             <label>Category
               <select name="categoryFilter">
                 <option value="">All</option>
-                ${CATEGORY_OPTIONS.map((category) => `<option value="${category}">${category}</option>`).join('')}
+                ${CATEGORY_OPTIONS.map((x) => `<option value="${x}">${x}</option>`).join('')}
               </select>
             </label>
-            <label>Who paid
-              <select name="paidByFilter" id="paidByFilter"></select>
-            </label>
+            <label>Who paid<input name="paidByFilter" placeholder="name" /></label>
             <label>Month<input name="monthFilter" type="month" /></label>
             <button type="button" id="clearFiltersButton" class="secondary">Clear</button>
           </form>
@@ -338,1277 +170,305 @@ function renderShell() {
             </table>
           </div>
         </section>
-
-        <section class="card">
-          <h3>Incomes</h3>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Date</th><th>Amount</th><th>Source</th><th>Type</th><th>Received by</th><th>Actions</th></tr></thead>
-              <tbody id="incomeTableBody"></tbody>
-            </table>
-          </div>
-        </section>
       </section>
     </main>
   `;
 }
 
 function showToast(message, isError = false) {
-  const toast = document.querySelector('#toast');
-  toast.classList.remove('hidden', 'danger');
-  if (isError) toast.classList.add('danger');
-  toast.textContent = message;
+  const el = document.querySelector('#toast');
+  el.classList.remove('hidden', 'danger');
+  if (isError) el.classList.add('danger');
+  el.textContent = message;
   window.setTimeout(() => {
-    toast.classList.add('hidden');
-    toast.classList.remove('danger');
-  }, 3500);
-}
-
-function formatCurrency(value) {
-  return new Intl.NumberFormat(LOCALE, { style: 'currency', currency: CURRENCY }).format(Number(value || 0));
-}
-
-function formatDate(value) {
-  return new Intl.DateTimeFormat(LOCALE).format(new Date(`${value}T00:00:00`));
-}
-
-function monthKey(value) {
-  const d = new Date(`${value}T00:00:00`);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-}
-
-function todayIso() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function escapeHtml(value) {
-  return String(value || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
+    el.classList.add('hidden');
+    el.classList.remove('danger');
+  }, 3000);
 }
 
 function setVisibleView(view) {
-  ['#authView', '#dobView', '#appView'].forEach((id) => document.querySelector(id).classList.add('hidden'));
+  ['#gateView', '#appView'].forEach((id) => document.querySelector(id).classList.add('hidden'));
   document.querySelector(view).classList.remove('hidden');
-}
-
-function normalizeEmail(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-async function sha256Hex(value) {
-  const data = new TextEncoder().encode(value);
-  const digest = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-function parseApprovedUsers() {
-  try {
-    const parsed = JSON.parse(APPROVED_USERS_JSON);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((x) => ({
-        email: normalizeEmail(x.email),
-        name: String(x.name || '').trim(),
-        dobHash: String(x.dobHash || '').trim().toLowerCase(),
-      }))
-      .filter((x) => x.email && x.name && x.dobHash.length === 64);
-  } catch {
-    return [];
-  }
-}
-
-function ensureFirebaseConfigured() {
-  if (FIREBASE_API_KEY && FIREBASE_AUTH_DOMAIN && FIREBASE_PROJECT_ID && FIREBASE_APP_ID) return true;
-  const error = document.querySelector('#configError');
-  error.classList.remove('hidden');
-  error.innerHTML =
-    'Missing Firebase config in <code>.env.local</code>: <code>VITE_FIREBASE_API_KEY</code>, <code>VITE_FIREBASE_AUTH_DOMAIN</code>, <code>VITE_FIREBASE_PROJECT_ID</code>, <code>VITE_FIREBASE_APP_ID</code>.';
-  setVisibleView('#configError');
-  return false;
-}
-
-function memberName(userId) {
-  return state.members.find((x) => x.user_id === userId)?.display_name || 'Unknown';
-}
-
-async function loadProfile() {
-  const email = normalizeEmail(state.session?.email);
-  const approved = approvedByEmail.get(email);
-  if (!approved) throw new Error('This email is not approved for this tracker.');
-  state.profile = { user_id: email, display_name: approved.name };
-}
-
-async function loadHousehold() {
-  const householdRef = doc(db, 'households', HOUSEHOLD_ID);
-  const snap = await getDoc(householdRef);
-  if (!snap.exists()) {
-    await setDoc(householdRef, {
-      name: 'Our Household',
-      monthlyBudget: 0,
-      members: {
-        [state.profile.user_id]: state.profile.display_name,
-      },
-      updatedAt: Date.now(),
-    });
-  } else {
-    const members = snap.data().members || {};
-    if (!members[state.profile.user_id]) {
-      await updateDoc(householdRef, {
-        [`members.${state.profile.user_id}`]: state.profile.display_name,
-        updatedAt: Date.now(),
-      });
-    }
-  }
-
-  const refreshed = await getDoc(householdRef);
-  const data = refreshed.data();
-  state.household = { id: HOUSEHOLD_ID, name: String(data?.name || 'Our Household') };
-  state.monthlyBudget = Number(data?.monthlyBudget || 0);
-  const memberEntries = Object.entries(data?.members || {});
-  state.members = memberEntries.map(([user_id, display_name]) => ({ user_id, display_name: String(display_name) }));
-}
-
-async function loadMembers() {
-  await loadHousehold();
-}
-
-async function loadBudgets() {
-  const householdSnap = await getDoc(doc(db, 'households', HOUSEHOLD_ID));
-  state.monthlyBudget = Number(householdSnap.data()?.monthlyBudget || 0);
-  const budgetsSnap = await getDocs(collection(db, 'households', HOUSEHOLD_ID, 'categoryBudgets'));
-  state.categoryBudgets = budgetsSnap.docs
-    .map((d) => ({ category: String(d.data().category || d.id), amount: Number(d.data().amount || 0) }))
-    .sort((a, b) => a.category.localeCompare(b.category));
-}
-
-async function loadExpenses() {
-  const snap = await getDocs(collection(db, 'households', HOUSEHOLD_ID, 'expenses'));
-  state.expenses = snap.docs
-    .map((d) => ({
-      id: d.id,
-      amount: Number(d.data().amount || 0),
-      expense_date: String(d.data().expense_date),
-      category: String(d.data().category),
-      classification: String(d.data().classification || 'reducible'),
-      description: String(d.data().description || ''),
-      paid_by: String(d.data().paid_by || ''),
-      notes: String(d.data().notes || ''),
-      is_irregular_annual: Boolean(d.data().is_irregular_annual),
-    }))
-    .sort((a, b) => `${b.expense_date}-${b.id}`.localeCompare(`${a.expense_date}-${a.id}`));
-}
-
-async function loadIncomes() {
-  const snap = await getDocs(collection(db, 'households', HOUSEHOLD_ID, 'incomes'));
-  state.incomes = snap.docs
-    .map((d) => ({
-      id: d.id,
-      amount: Number(d.data().amount || 0),
-      income_date: String(d.data().income_date),
-      source: String(d.data().source || ''),
-      income_type: String(d.data().income_type || 'other'),
-      received_by: String(d.data().received_by || ''),
-      notes: String(d.data().notes || ''),
-    }))
-    .sort((a, b) => `${b.income_date}-${b.id}`.localeCompare(`${a.income_date}-${a.id}`));
-}
-
-async function loadRecurring() {
-  const [recExpSnap, recIncSnap] = await Promise.all([
-    getDocs(collection(db, 'households', HOUSEHOLD_ID, 'recurringExpenses')),
-    getDocs(collection(db, 'households', HOUSEHOLD_ID, 'recurringIncomes')),
-  ]);
-  state.recurringExpenses = recExpSnap.docs
-    .map((d) => ({
-      id: d.id,
-      title: String(d.data().title || ''),
-      amount: Number(d.data().amount || 0),
-      category: String(d.data().category || 'Other'),
-      cadence: String(d.data().cadence || 'monthly'),
-      next_due_date: String(d.data().next_due_date || todayIso()),
-      notes: String(d.data().notes || ''),
-      active: Boolean(d.data().active),
-    }))
-    .sort((a, b) => a.next_due_date.localeCompare(b.next_due_date));
-
-  state.recurringIncomes = recIncSnap.docs
-    .map((d) => ({
-      id: d.id,
-      title: String(d.data().title || ''),
-      amount: Number(d.data().amount || 0),
-      income_type: String(d.data().income_type || 'other'),
-      cadence: String(d.data().cadence || 'monthly'),
-      next_due_date: String(d.data().next_due_date || todayIso()),
-      received_by: String(d.data().received_by || ''),
-      notes: String(d.data().notes || ''),
-      active: Boolean(d.data().active),
-    }))
-    .sort((a, b) => a.next_due_date.localeCompare(b.next_due_date));
-}
-
-function monthsFromHistory() {
-  const keys = new Set();
-  state.expenses.forEach((x) => keys.add(monthKey(x.expense_date)));
-  state.incomes.forEach((x) => keys.add(monthKey(x.income_date)));
-  return Array.from(keys).sort();
-}
-
-function monthlyAmount(data, dateField, amountField, month, extraFilter = () => true) {
-  return data
-    .filter((item) => monthKey(item[dateField]) === month)
-    .filter(extraFilter)
-    .reduce((sum, item) => sum + Number(item[amountField]), 0);
-}
-
-function averageMonthly(data, dateField, amountField, extraFilter = () => true) {
-  const keys = Array.from(new Set(data.map((x) => monthKey(x[dateField])))).sort();
-  if (!keys.length) return 0;
-  const total = keys.reduce((sum, month) => sum + monthlyAmount(data, dateField, amountField, month, extraFilter), 0);
-  return total / keys.length;
-}
-
-function computeFinancialMetrics() {
-  const today = todayIso();
-  const thisMonth = monthKey(today);
-  const now = new Date(`${today}T00:00:00`);
-  const weekStart = new Date(now);
-  weekStart.setDate(now.getDate() - ((now.getDay() + 6) % 7));
-  const weekStartIso = weekStart.toISOString().slice(0, 10);
-  const thisYear = now.getFullYear();
-
-  const monthlyIncome = monthlyAmount(state.incomes, 'income_date', 'amount', thisMonth);
-  const monthlyExpense = monthlyAmount(state.expenses, 'expense_date', 'amount', thisMonth);
-  const essential = monthlyAmount(state.expenses, 'expense_date', 'amount', thisMonth, (x) => x.classification === 'essential');
-  const reducible = monthlyAmount(state.expenses, 'expense_date', 'amount', thisMonth, (x) => x.classification === 'reducible');
-  const optional = monthlyAmount(state.expenses, 'expense_date', 'amount', thisMonth, (x) => x.classification === 'optional');
-  const weekSpend = state.expenses.filter((x) => x.expense_date >= weekStartIso && x.expense_date <= today).reduce((s, x) => s + x.amount, 0);
-  const yearSpend = state.expenses.filter((x) => new Date(`${x.expense_date}T00:00:00`).getFullYear() === thisYear).reduce((s, x) => s + x.amount, 0);
-
-  const keys = monthsFromHistory();
-  const monthlyExpenseSeries = keys.map((month) => ({ label: month, value: monthlyAmount(state.expenses, 'expense_date', 'amount', month) }));
-  const monthlyIncomeSeries = keys.map((month) => ({ label: month, value: monthlyAmount(state.incomes, 'income_date', 'amount', month) }));
-
-  const avgMonthlySpending = averageMonthly(state.expenses, 'expense_date', 'amount');
-  const avgOptionalSpending = averageMonthly(state.expenses, 'expense_date', 'amount', (x) => x.classification === 'optional');
-  const minEssentialMonthly = keys.length
-    ? Math.min(...keys.map((month) => monthlyAmount(state.expenses, 'expense_date', 'amount', month, (x) => x.classification === 'essential')))
-    : 0;
-  const annualEquivalent = state.expenses.filter((x) => x.is_irregular_annual).reduce((s, x) => s + x.amount, 0) / 12;
-  const suggestedMonthlyTarget = minEssentialMonthly + avgOptionalSpending * 0.6 + annualEquivalent;
-
-  return {
-    monthlyIncome,
-    monthlyExpense,
-    essential,
-    reducible,
-    optional,
-    monthlySurplus: monthlyIncome - monthlyExpense,
-    weekSpend,
-    yearSpend,
-    monthlyExpenseSeries,
-    monthlyIncomeSeries,
-    avgMonthlySpending,
-    avgOptionalSpending,
-    minEssentialMonthly,
-    annualEquivalent,
-    suggestedMonthlyTarget,
-  };
-}
-
-function renderBars(containerId, rows, denominator = 0) {
-  const root = document.querySelector(containerId);
-  if (!rows.length) {
-    root.innerHTML = '<p class="muted">No data yet.</p>';
-    return;
-  }
-  const max = denominator > 0 ? denominator : Math.max(...rows.map((x) => x.value), 1);
-  root.innerHTML = rows
-    .map((row) => {
-      const width = Math.round((row.value / max) * 100);
-      return `
-        <div class="bar-row">
-          <div class="bar-label"><span>${escapeHtml(row.label)}</span><strong>${formatCurrency(row.value)}</strong></div>
-          <div class="bar-track"><span style="width:${width}%"></span></div>
-        </div>
-      `;
-    })
-    .join('');
-}
-
-function renderDashboard() {
-  const metrics = computeFinancialMetrics();
-  document.querySelector('#monthlyIncomeCard').textContent = formatCurrency(metrics.monthlyIncome);
-  document.querySelector('#monthlyExpenseCard').textContent = formatCurrency(metrics.monthlyExpense);
-  document.querySelector('#monthlyEssentialCard').textContent = formatCurrency(metrics.essential);
-  document.querySelector('#monthlyReducibleCard').textContent = formatCurrency(metrics.reducible);
-  document.querySelector('#monthlyOptionalCard').textContent = formatCurrency(metrics.optional);
-  document.querySelector('#monthlySurplusCard').textContent = formatCurrency(metrics.monthlySurplus);
-  document.querySelector('#weekSpendCard').textContent = formatCurrency(metrics.weekSpend);
-  document.querySelector('#yearSpendCard').textContent = formatCurrency(metrics.yearSpend);
-
-  const byCategory = new Map();
-  const byPerson = new Map();
-  const byClass = new Map([
-    ['essential', 0],
-    ['reducible', 0],
-    ['optional', 0],
-  ]);
-  const month = monthKey(todayIso());
-  state.expenses
-    .filter((x) => monthKey(x.expense_date) === month)
-    .forEach((expense) => {
-      byCategory.set(expense.category, (byCategory.get(expense.category) || 0) + expense.amount);
-      byPerson.set(memberName(expense.paid_by), (byPerson.get(memberName(expense.paid_by)) || 0) + expense.amount);
-      byClass.set(expense.classification, (byClass.get(expense.classification) || 0) + expense.amount);
-    });
-
-  renderBars(
-    '#categoryBreakdown',
-    Array.from(byCategory.entries())
-      .map(([label, value]) => ({ label, value }))
-      .sort((a, b) => b.value - a.value),
-    metrics.monthlyExpense || 1,
-  );
-  renderBars(
-    '#personBreakdown',
-    Array.from(byPerson.entries())
-      .map(([label, value]) => ({ label, value }))
-      .sort((a, b) => b.value - a.value),
-    metrics.monthlyExpense || 1,
-  );
-  renderBars(
-    '#classificationBreakdown',
-    EXPENSE_CLASSIFICATIONS.map((x) => ({ label: x.label, value: byClass.get(x.value) || 0 })),
-    metrics.monthlyExpense || 1,
-  );
-
-  renderBars(
-    '#monthlyExpenseTrend',
-    metrics.monthlyExpenseSeries.slice(-12).map((x) => ({ label: x.label, value: x.value })),
-  );
-  renderBars(
-    '#monthlyIncomeTrend',
-    metrics.monthlyIncomeSeries.slice(-12).map((x) => ({ label: x.label, value: x.value })),
-  );
-
-  document.querySelector('#avgMonthlySpendingCard').textContent = formatCurrency(metrics.avgMonthlySpending);
-  document.querySelector('#minEssentialCard').textContent = formatCurrency(metrics.minEssentialMonthly);
-  document.querySelector('#avgOptionalCard').textContent = formatCurrency(metrics.avgOptionalSpending);
-  document.querySelector('#annualEquivalentCard').textContent = formatCurrency(metrics.annualEquivalent);
-  document.querySelector('#suggestedTargetCard').textContent = formatCurrency(metrics.suggestedMonthlyTarget);
-}
-
-function renderAnnualIrregularExpenses() {
-  const root = document.querySelector('#annualExpenseList');
-  const annualExpenses = state.expenses.filter((x) => x.is_irregular_annual);
-  if (!annualExpenses.length) {
-    root.innerHTML = '<p class="muted">No irregular annual expenses marked yet.</p>';
-    return;
-  }
-  root.innerHTML = annualExpenses
-    .slice(0, 20)
-    .map(
-      (expense) => `
-    <div class="list-row">
-      <div>
-        <strong>${escapeHtml(expense.description)}</strong>
-        <p class="muted">${formatDate(expense.expense_date)} • ${escapeHtml(expense.category)} • ${formatCurrency(expense.amount)}</p>
-      </div>
-    </div>
-  `,
-    )
-    .join('');
-}
-
-function renderWhatIf() {
-  const metrics = computeFinancialMetrics();
-  const mode = state.scenario.mode;
-  const memberA = state.scenario.selectedMemberA || state.members[0]?.user_id || '';
-  const memberB = state.scenario.selectedMemberB || state.members[1]?.user_id || state.members[0]?.user_id || '';
-  const avgIncomeAll = averageMonthly(state.incomes, 'income_date', 'amount');
-  const avgIncomeA = averageMonthly(state.incomes, 'income_date', 'amount', (x) => x.received_by === memberA);
-  const avgIncomeB = averageMonthly(state.incomes, 'income_date', 'amount', (x) => x.received_by === memberB);
-
-  let scenarioIncome = avgIncomeAll;
-  if (mode === 'member-a') scenarioIncome = avgIncomeA;
-  if (mode === 'member-b') scenarioIncome = avgIncomeB;
-  if (mode === 'custom') scenarioIncome = Number(state.scenario.customIncome || 0);
-
-  const avgEssential = averageMonthly(state.expenses, 'expense_date', 'amount', (x) => x.classification === 'essential');
-  const avgReducible = averageMonthly(state.expenses, 'expense_date', 'amount', (x) => x.classification === 'reducible');
-  const avgOptional = averageMonthly(state.expenses, 'expense_date', 'amount', (x) => x.classification === 'optional');
-  const optionalReductionValue = avgOptional * (state.scenario.optionalReductionPercent / 100);
-  const projectedLifestyle = avgEssential + avgReducible + (avgOptional - optionalReductionValue);
-  const projectedSurplus = scenarioIncome - projectedLifestyle;
-
-  document.querySelector('#scenarioIncomeCard').textContent = formatCurrency(scenarioIncome);
-  document.querySelector('#scenarioEssentialCard').textContent = formatCurrency(avgEssential);
-  document.querySelector('#scenarioLifestyleCard').textContent = formatCurrency(avgEssential + avgReducible + avgOptional);
-  document.querySelector('#scenarioSavingsCard').textContent = formatCurrency(optionalReductionValue);
-  document.querySelector('#scenarioSurplusCard').textContent = formatCurrency(projectedSurplus);
-  document.querySelector('#scenarioOptionalReductionLabel').textContent = `${state.scenario.optionalReductionPercent}%`;
-
-  const month = monthKey(todayIso());
-  const upcomingRecurring = state.recurringExpenses.filter((x) => {
-    const due = new Date(`${x.next_due_date}T00:00:00`);
-    const diff = Math.floor((due - new Date(`${todayIso()}T00:00:00`)) / 86400000);
-    return x.active && diff >= 0 && diff <= 30;
-  });
-  document.querySelector('#upcomingRecurringCount').textContent = String(upcomingRecurring.length);
-
-  if (!state.scenario.selectedMemberA && state.members[0]) state.scenario.selectedMemberA = state.members[0].user_id;
-  if (!state.scenario.selectedMemberB && state.members[1]) state.scenario.selectedMemberB = state.members[1].user_id;
-  if (!state.scenario.selectedMemberB && state.members[0]) state.scenario.selectedMemberB = state.members[0].user_id;
-  document.querySelector('#scenarioMode').value = state.scenario.mode;
-  document.querySelector('#scenarioMemberA').value = state.scenario.selectedMemberA;
-  document.querySelector('#scenarioMemberB').value = state.scenario.selectedMemberB;
-  document.querySelector('#scenarioCustomIncome').value = Number(state.scenario.customIncome || 0).toFixed(2);
-  document.querySelector('#scenarioOptionalReduction').value = String(state.scenario.optionalReductionPercent);
-
-  const targetBudget = state.monthlyBudget > 0 ? state.monthlyBudget : metrics.suggestedMonthlyTarget;
-  const categoryBudgetRoot = document.querySelector('#categoryBudgetList');
-  if (!state.categoryBudgets.length) {
-    categoryBudgetRoot.innerHTML = `<p class="muted">No category budgets set. Suggested baseline: ${formatCurrency(targetBudget)}</p>`;
-  } else {
-    const monthExpense = state.expenses.filter((x) => monthKey(x.expense_date) === month);
-    const spentByCategory = new Map();
-    monthExpense.forEach((x) => spentByCategory.set(x.category, (spentByCategory.get(x.category) || 0) + x.amount));
-    categoryBudgetRoot.innerHTML = state.categoryBudgets
-      .map((item) => {
-        const spent = spentByCategory.get(item.category) || 0;
-        const remaining = item.amount - spent;
-        const statusClass = remaining < 0 ? 'danger-text' : remaining < item.amount * 0.2 ? 'warn-text' : '';
-        return `
-          <div class="list-row">
-            <div>
-              <strong>${escapeHtml(item.category)}</strong>
-              <p class="muted">${formatCurrency(spent)} spent / ${formatCurrency(item.amount)} budget</p>
-              <p class="muted ${statusClass}">${formatCurrency(Math.abs(remaining))} ${remaining >= 0 ? 'remaining' : 'over budget'}</p>
-            </div>
-            <button class="small danger" type="button" data-action="delete-category-budget" data-category="${escapeHtml(item.category)}">Delete</button>
-          </div>
-        `;
-      })
-      .join('');
-  }
-}
-
-function renderSelects() {
-  const options = state.members.map((x) => `<option value="${x.user_id}">${escapeHtml(x.display_name)}</option>`).join('');
-  document.querySelector('#paidBySelect').innerHTML = options;
-  document.querySelector('#paidByFilter').innerHTML = `<option value="">All</option>${options}`;
-  document.querySelector('#receivedBySelect').innerHTML = options;
-  document.querySelector('#recurringIncomeReceivedBy').innerHTML = options;
-  document.querySelector('#scenarioMemberA').innerHTML = options;
-  document.querySelector('#scenarioMemberB').innerHTML = options;
-  if (state.profile) {
-    document.querySelector('#paidBySelect').value = state.profile.user_id;
-    document.querySelector('#receivedBySelect').value = state.profile.user_id;
-    document.querySelector('#recurringIncomeReceivedBy').value = state.profile.user_id;
-  }
 }
 
 function filteredExpenses() {
   const q = state.filters.search.trim().toLowerCase();
   return state.expenses.filter((x) => {
-    const bySearch =
-      q.length === 0 ||
-      x.description.toLowerCase().includes(q) ||
-      (x.notes || '').toLowerCase().includes(q) ||
-      x.category.toLowerCase().includes(q);
+    const byQ = !q || x.description.toLowerCase().includes(q) || x.notes.toLowerCase().includes(q);
     const byCategory = !state.filters.category || x.category === state.filters.category;
-    const byPaidBy = !state.filters.paidBy || x.paid_by === state.filters.paidBy;
+    const byPaidBy = !state.filters.paidBy || x.paid_by.toLowerCase().includes(state.filters.paidBy.toLowerCase());
     const byMonth = !state.filters.month || monthKey(x.expense_date) === state.filters.month;
-    return bySearch && byCategory && byPaidBy && byMonth;
+    return byQ && byCategory && byPaidBy && byMonth;
   });
+}
+
+function renderBars(containerId, rows) {
+  const root = document.querySelector(containerId);
+  if (!rows.length) {
+    root.innerHTML = '<p class="muted">No data yet.</p>';
+    return;
+  }
+  const max = Math.max(...rows.map((x) => x.value), 1);
+  root.innerHTML = rows
+    .map((row) => {
+      const width = Math.round((row.value / max) * 100);
+      return `<div class="bar-row"><div class="bar-label"><span>${escapeHtml(row.label)}</span><strong>${formatCurrency(row.value)}</strong></div><div class="bar-track"><span style="width:${width}%"></span></div></div>`;
+    })
+    .join('');
+}
+
+function renderDashboard() {
+  document.querySelector('#signedInName').textContent = state.user;
+  const now = todayIso();
+  const month = monthKey(now);
+  const start = new Date(`${now}T00:00:00`);
+  const weekStart = new Date(start);
+  weekStart.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+  const weekStartIso = weekStart.toISOString().slice(0, 10);
+  const year = start.getFullYear();
+
+  const monthSpend = state.expenses.filter((x) => monthKey(x.expense_date) === month).reduce((s, x) => s + x.amount, 0);
+  const weekSpend = state.expenses.filter((x) => x.expense_date >= weekStartIso && x.expense_date <= now).reduce((s, x) => s + x.amount, 0);
+  const yearSpend = state.expenses.filter((x) => new Date(`${x.expense_date}T00:00:00`).getFullYear() === year).reduce((s, x) => s + x.amount, 0);
+
+  document.querySelector('#monthSpendCard').textContent = formatCurrency(monthSpend);
+  document.querySelector('#weekSpendCard').textContent = formatCurrency(weekSpend);
+  document.querySelector('#yearSpendCard').textContent = formatCurrency(yearSpend);
+  document.querySelector('#budgetCard').textContent = formatCurrency(state.monthlyBudget);
+  document.querySelector('#budgetForm').budget.value = Number(state.monthlyBudget || 0).toFixed(2);
+
+  const fill = document.querySelector('#budgetFill');
+  const status = document.querySelector('#budgetStatus');
+  if (state.monthlyBudget <= 0) {
+    fill.style.width = '0%';
+    fill.className = '';
+    status.textContent = 'Set a monthly budget to track progress.';
+  } else {
+    const ratio = (monthSpend / state.monthlyBudget) * 100;
+    fill.style.width = `${Math.min(Math.round(ratio), 100)}%`;
+    fill.className = ratio >= 100 ? 'danger-fill' : ratio >= 80 ? 'warn-fill' : '';
+    status.textContent =
+      ratio >= 100
+        ? `Over budget by ${formatCurrency(monthSpend - state.monthlyBudget)}`
+        : `Remaining budget: ${formatCurrency(state.monthlyBudget - monthSpend)}`;
+  }
+
+  const monthRows = state.expenses.filter((x) => monthKey(x.expense_date) === month);
+  const byCategory = new Map();
+  const byPerson = new Map();
+  monthRows.forEach((x) => {
+    byCategory.set(x.category, (byCategory.get(x.category) || 0) + x.amount);
+    byPerson.set(x.paid_by, (byPerson.get(x.paid_by) || 0) + x.amount);
+  });
+  renderBars('#categoryBreakdown', Array.from(byCategory.entries()).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value));
+  renderBars('#personBreakdown', Array.from(byPerson.entries()).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value));
+
+  const monthTotals = new Map();
+  state.expenses.forEach((x) => monthTotals.set(monthKey(x.expense_date), (monthTotals.get(monthKey(x.expense_date)) || 0) + x.amount));
+  const trend = Array.from(monthTotals.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .slice(-6)
+    .map(([label, value]) => ({ label, value }));
+  renderBars('#trendBreakdown', trend);
 }
 
 function renderExpensesTable() {
   const body = document.querySelector('#expenseTableBody');
   const rows = filteredExpenses();
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="muted">No expenses match filters.</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="muted">No expenses found.</td></tr>';
     return;
   }
   body.innerHTML = rows
     .map(
       (x) => `
-    <tr>
-      <td>${formatDate(x.expense_date)}</td>
-      <td>${formatCurrency(x.amount)}</td>
-      <td>${escapeHtml(x.category)}</td>
-      <td>${escapeHtml(EXPENSE_CLASSIFICATIONS.find((c) => c.value === x.classification)?.label || x.classification)}</td>
-      <td>${escapeHtml(x.description)}</td>
-      <td>${escapeHtml(memberName(x.paid_by))}</td>
-      <td>
-        <div class="table-actions">
-          <button class="small secondary" type="button" data-action="edit-expense" data-id="${x.id}">Edit</button>
-          <button class="small danger" type="button" data-action="delete-expense" data-id="${x.id}">Delete</button>
-        </div>
-      </td>
-    </tr>
-  `,
+      <tr>
+        <td>${formatDate(x.expense_date)}</td>
+        <td>${formatCurrency(x.amount)}</td>
+        <td>${escapeHtml(x.category)}</td>
+        <td>${escapeHtml(CLASSIFICATIONS.find((c) => c.value === x.classification)?.label || x.classification)}</td>
+        <td>${escapeHtml(x.description)}</td>
+        <td>${escapeHtml(x.paid_by)}</td>
+        <td><div class="table-actions"><button type="button" class="small secondary" data-action="edit" data-id="${x.id}">Edit</button><button type="button" class="small danger" data-action="delete" data-id="${x.id}">Delete</button></div></td>
+      </tr>
+    `,
     )
     .join('');
 }
 
-function renderIncomesTable() {
-  const body = document.querySelector('#incomeTableBody');
-  if (!state.incomes.length) {
-    body.innerHTML = '<tr><td colspan="6" class="muted">No income records yet.</td></tr>';
-    return;
-  }
-  body.innerHTML = state.incomes
-    .map(
-      (x) => `
-    <tr>
-      <td>${formatDate(x.income_date)}</td>
-      <td>${formatCurrency(x.amount)}</td>
-      <td>${escapeHtml(x.source)}</td>
-      <td>${escapeHtml(x.income_type)}</td>
-      <td>${escapeHtml(memberName(x.received_by))}</td>
-      <td>
-        <div class="table-actions">
-          <button class="small secondary" type="button" data-action="edit-income" data-id="${x.id}">Edit</button>
-          <button class="small danger" type="button" data-action="delete-income" data-id="${x.id}">Delete</button>
-        </div>
-      </td>
-    </tr>
-  `,
-    )
-    .join('');
-}
-
-function renderRecurringLists() {
-  const expRoot = document.querySelector('#recurringExpenseList');
-  const incRoot = document.querySelector('#recurringIncomeList');
-
-  expRoot.innerHTML = state.recurringExpenses.length
-    ? state.recurringExpenses
-        .map(
-          (x) => `
-      <div class="list-row">
-        <div>
-          <strong>${escapeHtml(x.title)}</strong>
-          <p class="muted">${formatCurrency(x.amount)} • ${escapeHtml(x.category)} • ${escapeHtml(x.cadence)} • due ${formatDate(x.next_due_date)} • ${x.active ? 'Active' : 'Paused'}</p>
-        </div>
-        <div class="table-actions">
-          <button class="small secondary" type="button" data-action="edit-rec-exp" data-id="${x.id}">Edit</button>
-          <button class="small secondary" type="button" data-action="toggle-rec-exp" data-id="${x.id}">${x.active ? 'Pause' : 'Activate'}</button>
-          <button class="small danger" type="button" data-action="delete-rec-exp" data-id="${x.id}">Delete</button>
-        </div>
-      </div>
-    `,
-        )
-        .join('')
-    : '<p class="muted">No recurring expenses.</p>';
-
-  incRoot.innerHTML = state.recurringIncomes.length
-    ? state.recurringIncomes
-        .map(
-          (x) => `
-      <div class="list-row">
-        <div>
-          <strong>${escapeHtml(x.title)}</strong>
-          <p class="muted">${formatCurrency(x.amount)} • ${escapeHtml(x.income_type)} • ${escapeHtml(x.cadence)} • next ${formatDate(x.next_due_date)} • ${x.active ? 'Active' : 'Paused'}</p>
-        </div>
-        <div class="table-actions">
-          <button class="small secondary" type="button" data-action="edit-rec-inc" data-id="${x.id}">Edit</button>
-          <button class="small secondary" type="button" data-action="toggle-rec-inc" data-id="${x.id}">${x.active ? 'Pause' : 'Activate'}</button>
-          <button class="small danger" type="button" data-action="delete-rec-inc" data-id="${x.id}">Delete</button>
-        </div>
-      </div>
-    `,
-        )
-        .join('')
-    : '<p class="muted">No recurring incomes.</p>';
+function renderAll() {
+  renderDashboard();
+  renderExpensesTable();
 }
 
 function resetExpenseForm() {
-  state.editingExpenseId = null;
+  state.editingId = null;
   const form = document.querySelector('#expenseForm');
   form.reset();
   form.expenseDate.value = todayIso();
   form.classification.value = 'reducible';
-  if (state.profile) form.paidBy.value = state.profile.user_id;
+  form.paidBy.value = state.user || '';
   document.querySelector('#expenseFormTitle').textContent = 'Quick expense entry';
   document.querySelector('#saveExpenseButton').textContent = 'Add expense';
-  document.querySelector('#cancelExpenseEditButton').classList.add('hidden');
+  document.querySelector('#cancelEditButton').classList.add('hidden');
 }
 
-function resetIncomeForm() {
-  state.editingIncomeId = null;
-  const form = document.querySelector('#incomeForm');
-  form.reset();
-  form.incomeDate.value = todayIso();
-  form.incomeType.value = 'salary';
-  if (state.profile) form.receivedBy.value = state.profile.user_id;
-  document.querySelector('#incomeFormTitle').textContent = 'Income entry';
-  document.querySelector('#saveIncomeButton').textContent = 'Add income';
-  document.querySelector('#cancelIncomeEditButton').classList.add('hidden');
-}
-
-function resetRecurringForms() {
-  state.editingRecurringExpenseId = null;
-  state.editingRecurringIncomeId = null;
-  const expenseForm = document.querySelector('#recurringExpenseForm');
-  const incomeForm = document.querySelector('#recurringIncomeForm');
-  expenseForm.reset();
-  incomeForm.reset();
-  expenseForm.nextDueDate.value = todayIso();
-  incomeForm.nextDueDate.value = todayIso();
-  if (state.profile) {
-    incomeForm.receivedBy.value = state.profile.user_id;
-  }
-  document.querySelector('#recurringExpenseFormTitle').textContent = 'Recurring expenses';
-  document.querySelector('#saveRecurringExpenseButton').textContent = 'Add recurring expense';
-  document.querySelector('#cancelRecurringExpenseEditButton').classList.add('hidden');
-  document.querySelector('#recurringIncomeFormTitle').textContent = 'Recurring incomes';
-  document.querySelector('#saveRecurringIncomeButton').textContent = 'Add recurring income';
-  document.querySelector('#cancelRecurringIncomeEditButton').classList.add('hidden');
-}
-
-function renderHeader() {
-  document.querySelector('#householdTitle').textContent = state.household?.name || '';
-  document.querySelector('#signedInName').textContent = state.profile?.display_name || '';
-}
-
-function renderAll() {
-  renderHeader();
-  renderSelects();
-  renderDashboard();
-  renderAnnualIrregularExpenses();
-  renderWhatIf();
-  renderExpensesTable();
-  renderIncomesTable();
-  renderRecurringLists();
-  resetExpenseForm();
-  resetIncomeForm();
-  resetRecurringForms();
-}
-
-async function refreshData() {
-  await Promise.all([loadMembers(), loadBudgets(), loadExpenses(), loadIncomes(), loadRecurring()]);
-  renderAll();
-}
-
-function setupRealtime() {
-  unsubscribeFns.forEach((fn) => fn());
-  unsubscribeFns = [];
-  if (!state.household) return;
-  const rerender = () => renderAll();
-  const watchCollection = (name, assign) =>
-    onSnapshot(collection(db, 'households', HOUSEHOLD_ID, name), (snap) => {
-      assign(snap);
-      rerender();
-    });
-
-  unsubscribeFns.push(
-    onSnapshot(doc(db, 'households', HOUSEHOLD_ID), (snap) => {
-      const data = snap.data() || {};
-      state.household = { id: HOUSEHOLD_ID, name: String(data.name || 'Our Household') };
-      state.monthlyBudget = Number(data.monthlyBudget || 0);
-      state.members = Object.entries(data.members || {}).map(([user_id, display_name]) => ({ user_id, display_name: String(display_name) }));
-      rerender();
-    }),
-  );
-  unsubscribeFns.push(
-    watchCollection('expenses', (snap) => {
-      state.expenses = snap.docs
-        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
-        .sort((a, b) => `${b.expense_date}-${b.id}`.localeCompare(`${a.expense_date}-${a.id}`));
-    }),
-  );
-  unsubscribeFns.push(
-    watchCollection('incomes', (snap) => {
-      state.incomes = snap.docs
-        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
-        .sort((a, b) => `${b.income_date}-${b.id}`.localeCompare(`${a.income_date}-${a.id}`));
-    }),
-  );
-  unsubscribeFns.push(
-    watchCollection('categoryBudgets', (snap) => {
-      state.categoryBudgets = snap.docs
-        .map((d) => ({ category: String(d.data().category || d.id), amount: Number(d.data().amount || 0) }))
-        .sort((a, b) => a.category.localeCompare(b.category));
-    }),
-  );
-  unsubscribeFns.push(
-    watchCollection('recurringExpenses', (snap) => {
-      state.recurringExpenses = snap.docs
-        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
-        .sort((a, b) => String(a.next_due_date || '').localeCompare(String(b.next_due_date || '')));
-    }),
-  );
-  unsubscribeFns.push(
-    watchCollection('recurringIncomes', (snap) => {
-      state.recurringIncomes = snap.docs
-        .map((d) => ({ id: d.id, ...d.data(), amount: Number(d.data().amount || 0) }))
-        .sort((a, b) => String(a.next_due_date || '').localeCompare(String(b.next_due_date || '')));
-    }),
-  );
-}
-
-async function handleMagicLink(event) {
+async function handleUnlock(event) {
   event.preventDefault();
   const form = new FormData(event.target);
-  const email = normalizeEmail(form.get('email'));
-  if (!email) throw new Error('Enter your approved email address.');
-  if (!approvedByEmail.has(email)) throw new Error('This email is not approved for this tracker.');
-  await sendSignInLinkToEmail(auth, email, {
-    url: `${window.location.origin}${window.location.pathname}`,
-    handleCodeInApp: true,
-  });
-  window.localStorage.setItem('expenseTrackerEmailForSignIn', email);
-  showToast('Magic link sent. Open it from your email on this device.');
-}
-
-async function handleDobVerify(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const dob = String(form.get('dob') || '');
-  if (!dob) throw new Error('Enter your date of birth.');
-  const email = normalizeEmail(state.session?.email);
-  const approved = approvedByEmail.get(email);
-  if (!approved) throw new Error('This email is not approved for this tracker.');
-  const actualHash = await sha256Hex(dob);
-  if (actualHash !== approved.dobHash) throw new Error('DOB does not match the approved profile.');
-  state.dobVerified = true;
-  await refreshData();
-  setupRealtime();
+  const rawName = String(form.get('name') || '').trim();
+  const name = rawName.toLowerCase();
+  const dob = String(form.get('dob') || '').trim();
+  if (!name || !dob) throw new Error('Enter name and DOB.');
+  if (!APPROVED_NAMES.includes(name)) throw new Error('Name is not approved.');
+  if (dob !== todayIso()) throw new Error("DOB must match today's date for this access rule.");
+  state.user = rawName;
+  state.unlocked = true;
+  sessionStorage.setItem(SESSION_UNLOCK_KEY, JSON.stringify({ user: state.user, ts: Date.now() }));
   setVisibleView('#appView');
+  renderAll();
+  resetExpenseForm();
 }
 
-async function handleCategoryBudgetSave(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const category = String(form.get('category'));
-  const amount = Number(form.get('amount'));
-  if (!category || !Number.isFinite(amount) || amount < 0) throw new Error('Enter a valid category budget.');
-  await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'categoryBudgets', category), { category, amount, updatedAt: Date.now() }, { merge: true });
-  await loadBudgets();
-  renderWhatIf();
-}
-
-async function handleExpenseSave(event) {
+function handleExpenseSave(event) {
   event.preventDefault();
   const form = new FormData(event.target);
   const payload = {
+    id: state.editingId || crypto.randomUUID(),
     amount: Number(form.get('amount')),
     expense_date: String(form.get('expenseDate')),
     category: String(form.get('category')),
     classification: String(form.get('classification')),
-    description: String(form.get('description')).trim(),
-    paid_by: String(form.get('paidBy')),
-    notes: String(form.get('notes')).trim(),
-    is_irregular_annual: form.get('isIrregularAnnual') === 'on',
+    description: String(form.get('description') || '').trim(),
+    paid_by: String(form.get('paidBy') || '').trim(),
+    notes: String(form.get('notes') || '').trim(),
   };
-  if (!Number.isFinite(payload.amount) || payload.amount <= 0) throw new Error('Amount must be greater than zero.');
-
-  if (state.editingExpenseId) {
-    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'expenses', state.editingExpenseId), { ...payload, updatedAt: Date.now() }, { merge: true });
+  if (!Number.isFinite(payload.amount) || payload.amount <= 0 || !payload.description || !payload.paid_by) throw new Error('Enter valid expense details.');
+  if (state.editingId) {
+    state.expenses = state.expenses.map((x) => (x.id === state.editingId ? payload : x));
   } else {
-    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'expenses'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
+    state.expenses.unshift(payload);
   }
-  await loadExpenses();
-  renderDashboard();
-  renderExpensesTable();
-  renderAnnualIrregularExpenses();
-  renderWhatIf();
+  saveState();
+  renderAll();
   resetExpenseForm();
-}
-
-async function handleIncomeSave(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const payload = {
-    amount: Number(form.get('amount')),
-    income_date: String(form.get('incomeDate')),
-    source: String(form.get('source')).trim(),
-    income_type: String(form.get('incomeType')),
-    received_by: String(form.get('receivedBy')),
-    notes: String(form.get('notes')).trim(),
-  };
-  if (!Number.isFinite(payload.amount) || payload.amount <= 0 || !payload.source) throw new Error('Enter a valid income record.');
-
-  if (state.editingIncomeId) {
-    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'incomes', state.editingIncomeId), { ...payload, updatedAt: Date.now() }, { merge: true });
-  } else {
-    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'incomes'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
-  }
-  await loadIncomes();
-  renderDashboard();
-  renderIncomesTable();
-  renderWhatIf();
-  resetIncomeForm();
-}
-
-async function handleRecurringExpenseSave(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const payload = {
-    title: String(form.get('title')).trim(),
-    amount: Number(form.get('amount')),
-    category: String(form.get('category')),
-    cadence: String(form.get('cadence')),
-    next_due_date: String(form.get('nextDueDate')),
-    notes: String(form.get('notes')).trim(),
-    active: true,
-  };
-  if (!payload.title || !Number.isFinite(payload.amount) || payload.amount <= 0) throw new Error('Enter a valid recurring expense.');
-
-  if (state.editingRecurringExpenseId) {
-    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringExpenses', state.editingRecurringExpenseId), { ...payload, updatedAt: Date.now() }, { merge: true });
-  } else {
-    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringExpenses'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
-  }
-  await loadRecurring();
-  renderRecurringLists();
-  renderWhatIf();
-  resetRecurringForms();
-}
-
-async function handleRecurringIncomeSave(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const payload = {
-    title: String(form.get('title')).trim(),
-    amount: Number(form.get('amount')),
-    income_type: String(form.get('incomeType')),
-    cadence: String(form.get('cadence')),
-    next_due_date: String(form.get('nextDueDate')),
-    received_by: String(form.get('receivedBy')),
-    notes: String(form.get('notes')).trim(),
-    active: true,
-  };
-  if (!payload.title || !Number.isFinite(payload.amount) || payload.amount <= 0) throw new Error('Enter a valid recurring income.');
-  if (state.editingRecurringIncomeId) {
-    await setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringIncomes', state.editingRecurringIncomeId), { ...payload, updatedAt: Date.now() }, { merge: true });
-  } else {
-    await addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringIncomes'), { ...payload, createdAt: Date.now(), updatedAt: Date.now() });
-  }
-  await loadRecurring();
-  renderRecurringLists();
-  resetRecurringForms();
-}
-
-async function deleteExpense(id) {
-  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, 'expenses', id));
-  await loadExpenses();
-  renderExpensesTable();
-  renderDashboard();
-  renderWhatIf();
-}
-
-async function deleteIncome(id) {
-  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, 'incomes', id));
-  await loadIncomes();
-  renderIncomesTable();
-  renderDashboard();
-  renderWhatIf();
-}
-
-async function toggleRecurring(table, id, current) {
-  const collectionName = table === 'recurring_expenses' ? 'recurringExpenses' : 'recurringIncomes';
-  await setDoc(doc(db, 'households', HOUSEHOLD_ID, collectionName, id), { active: !current.active, updatedAt: Date.now() }, { merge: true });
-  await loadRecurring();
-  renderRecurringLists();
-  renderWhatIf();
-}
-
-async function deleteRecurring(table, id) {
-  const collectionName = table === 'recurring_expenses' ? 'recurringExpenses' : 'recurringIncomes';
-  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, collectionName, id));
-  await loadRecurring();
-  renderRecurringLists();
-  renderWhatIf();
-}
-
-async function deleteCategoryBudget(category) {
-  await deleteDoc(doc(db, 'households', HOUSEHOLD_ID, 'categoryBudgets', category));
-  await loadBudgets();
-  renderWhatIf();
 }
 
 function handleExpenseActions(event) {
   const button = event.target.closest('button[data-action]');
   if (!button) return;
-  const action = button.dataset.action;
   const id = button.dataset.id;
-
-  if (action === 'edit-expense') {
-    const row = state.expenses.find((x) => x.id === id);
-    if (!row) return;
-    state.editingExpenseId = id;
-    const form = document.querySelector('#expenseForm');
-    form.amount.value = row.amount.toFixed(2);
-    form.expenseDate.value = row.expense_date;
-    form.category.value = row.category;
-    form.classification.value = row.classification;
-    form.description.value = row.description;
-    form.paidBy.value = row.paid_by;
-    form.notes.value = row.notes || '';
-    form.isIrregularAnnual.checked = Boolean(row.is_irregular_annual);
-    document.querySelector('#expenseFormTitle').textContent = 'Edit expense';
-    document.querySelector('#saveExpenseButton').textContent = 'Update expense';
-    document.querySelector('#cancelExpenseEditButton').classList.remove('hidden');
+  if (button.dataset.action === 'delete') {
+    if (!window.confirm('Delete this expense?')) return;
+    state.expenses = state.expenses.filter((x) => x.id !== id);
+    saveState();
+    renderAll();
     return;
   }
-
-  if (action === 'delete-expense' && window.confirm('Delete this expense?')) {
-    deleteExpense(id).catch((error) => showToast(error.message, true));
-  }
-}
-
-function handleIncomeActions(event) {
-  const button = event.target.closest('button[data-action]');
-  if (!button) return;
-  const action = button.dataset.action;
-  const id = button.dataset.id;
-
-  if (action === 'edit-income') {
-    const row = state.incomes.find((x) => x.id === id);
-    if (!row) return;
-    state.editingIncomeId = id;
-    const form = document.querySelector('#incomeForm');
-    form.amount.value = row.amount.toFixed(2);
-    form.incomeDate.value = row.income_date;
-    form.source.value = row.source;
-    form.incomeType.value = row.income_type;
-    form.receivedBy.value = row.received_by;
-    form.notes.value = row.notes || '';
-    document.querySelector('#incomeFormTitle').textContent = 'Edit income';
-    document.querySelector('#saveIncomeButton').textContent = 'Update income';
-    document.querySelector('#cancelIncomeEditButton').classList.remove('hidden');
-    return;
-  }
-
-  if (action === 'delete-income' && window.confirm('Delete this income record?')) {
-    deleteIncome(id).catch((error) => showToast(error.message, true));
-  }
-}
-
-function handleRecurringActions(event) {
-  const button = event.target.closest('button[data-action]');
-  if (!button) return;
-  const action = button.dataset.action;
-  const id = button.dataset.id;
-
-  if (action === 'delete-category-budget') {
-    deleteCategoryBudget(button.dataset.category).catch((error) => showToast(error.message, true));
-    return;
-  }
-
-  if (action === 'edit-rec-exp') {
-    const row = state.recurringExpenses.find((x) => x.id === id);
-    if (!row) return;
-    state.editingRecurringExpenseId = id;
-    const form = document.querySelector('#recurringExpenseForm');
-    form.title.value = row.title;
-    form.amount.value = row.amount.toFixed(2);
-    form.category.value = row.category;
-    form.cadence.value = row.cadence;
-    form.nextDueDate.value = row.next_due_date;
-    form.notes.value = row.notes || '';
-    document.querySelector('#recurringExpenseFormTitle').textContent = 'Edit recurring expense';
-    document.querySelector('#saveRecurringExpenseButton').textContent = 'Update recurring expense';
-    document.querySelector('#cancelRecurringExpenseEditButton').classList.remove('hidden');
-    return;
-  }
-  if (action === 'toggle-rec-exp') {
-    const row = state.recurringExpenses.find((x) => x.id === id);
-    if (!row) return;
-    toggleRecurring('recurring_expenses', id, row).catch((error) => showToast(error.message, true));
-    return;
-  }
-  if (action === 'delete-rec-exp' && window.confirm('Delete recurring expense?')) {
-    deleteRecurring('recurring_expenses', id).catch((error) => showToast(error.message, true));
-    return;
-  }
-
-  if (action === 'edit-rec-inc') {
-    const row = state.recurringIncomes.find((x) => x.id === id);
-    if (!row) return;
-    state.editingRecurringIncomeId = id;
-    const form = document.querySelector('#recurringIncomeForm');
-    form.title.value = row.title;
-    form.amount.value = row.amount.toFixed(2);
-    form.incomeType.value = row.income_type;
-    form.cadence.value = row.cadence;
-    form.nextDueDate.value = row.next_due_date;
-    form.receivedBy.value = row.received_by;
-    form.notes.value = row.notes || '';
-    document.querySelector('#recurringIncomeFormTitle').textContent = 'Edit recurring income';
-    document.querySelector('#saveRecurringIncomeButton').textContent = 'Update recurring income';
-    document.querySelector('#cancelRecurringIncomeEditButton').classList.remove('hidden');
-    return;
-  }
-  if (action === 'toggle-rec-inc') {
-    const row = state.recurringIncomes.find((x) => x.id === id);
-    if (!row) return;
-    toggleRecurring('recurring_incomes', id, row).catch((error) => showToast(error.message, true));
-    return;
-  }
-  if (action === 'delete-rec-inc' && window.confirm('Delete recurring income?')) {
-    deleteRecurring('recurring_incomes', id).catch((error) => showToast(error.message, true));
-  }
+  const row = state.expenses.find((x) => x.id === id);
+  if (!row) return;
+  state.editingId = row.id;
+  const form = document.querySelector('#expenseForm');
+  form.amount.value = row.amount.toFixed(2);
+  form.expenseDate.value = row.expense_date;
+  form.category.value = row.category;
+  form.classification.value = row.classification;
+  form.description.value = row.description;
+  form.paidBy.value = row.paid_by;
+  form.notes.value = row.notes || '';
+  document.querySelector('#expenseFormTitle').textContent = 'Edit expense';
+  document.querySelector('#saveExpenseButton').textContent = 'Update expense';
+  document.querySelector('#cancelEditButton').classList.remove('hidden');
 }
 
 function exportCsv() {
-  const expenseRows = filteredExpenses().map((x) => ({
+  const rows = filteredExpenses().map((x) => ({
     date: x.expense_date,
     amount_eur: x.amount.toFixed(2),
     category: x.category,
     classification: x.classification,
     description: x.description,
-    paid_by: memberName(x.paid_by),
-    irregular_annual: x.is_irregular_annual ? 'yes' : 'no',
+    paid_by: x.paid_by,
     notes: x.notes || '',
   }));
-  const incomeRows = state.incomes.map((x) => ({
-    date: x.income_date,
-    amount_eur: x.amount.toFixed(2),
-    source: x.source,
-    type: x.income_type,
-    received_by: memberName(x.received_by),
-    notes: x.notes || '',
-  }));
-
-  const toCsv = (rows) => {
-    if (!rows.length) return '';
-    const headers = Object.keys(rows[0]);
-    return [headers.join(','), ...rows.map((row) => headers.map((h) => `"${String(row[h]).replaceAll('"', '""')}"`).join(','))].join('\n');
-  };
-
-  const csv = `EXPENSES\n${toCsv(expenseRows)}\n\nINCOMES\n${toCsv(incomeRows)}`;
+  if (!rows.length) throw new Error('No rows to export.');
+  const headers = Object.keys(rows[0]);
+  const csv = [headers.join(','), ...rows.map((row) => headers.map((h) => `"${String(row[h]).replaceAll('"', '""')}"`).join(','))].join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `household-finance-${todayIso()}.csv`;
-  document.body.appendChild(a);
+  a.download = `household-expenses-${todayIso()}.csv`;
   a.click();
-  a.remove();
   URL.revokeObjectURL(url);
 }
 
 function exportExcel() {
-  const wb = utils.book_new();
-  const expenseData = state.expenses.map((x) => ({
+  const rows = filteredExpenses().map((x) => ({
     Date: x.expense_date,
-    Amount_EUR: Number(x.amount.toFixed(2)),
+    Amount_EUR: x.amount,
     Category: x.category,
     Classification: x.classification,
     Description: x.description,
-    Paid_By: memberName(x.paid_by),
-    Irregular_Annual: x.is_irregular_annual ? 'Yes' : 'No',
+    Paid_By: x.paid_by,
     Notes: x.notes || '',
   }));
-  const incomeData = state.incomes.map((x) => ({
-    Date: x.income_date,
-    Amount_EUR: Number(x.amount.toFixed(2)),
-    Source: x.source,
-    Type: x.income_type,
-    Received_By: memberName(x.received_by),
-    Notes: x.notes || '',
-  }));
-  const recExpData = state.recurringExpenses.map((x) => ({
-    Title: x.title,
-    Amount_EUR: Number(x.amount.toFixed(2)),
-    Category: x.category,
-    Cadence: x.cadence,
-    Next_Due: x.next_due_date,
-    Active: x.active ? 'Yes' : 'No',
-    Notes: x.notes || '',
-  }));
-  const recIncData = state.recurringIncomes.map((x) => ({
-    Title: x.title,
-    Amount_EUR: Number(x.amount.toFixed(2)),
-    Type: x.income_type,
-    Cadence: x.cadence,
-    Next_Due: x.next_due_date,
-    Received_By: memberName(x.received_by),
-    Active: x.active ? 'Yes' : 'No',
-    Notes: x.notes || '',
-  }));
-  utils.book_append_sheet(wb, utils.json_to_sheet(expenseData), 'Expenses');
-  utils.book_append_sheet(wb, utils.json_to_sheet(incomeData), 'Incomes');
-  utils.book_append_sheet(wb, utils.json_to_sheet(recExpData), 'Recurring_Expenses');
-  utils.book_append_sheet(wb, utils.json_to_sheet(recIncData), 'Recurring_Incomes');
-  writeFileXLSX(wb, `household-finance-${todayIso()}.xlsx`);
+  if (!rows.length) throw new Error('No rows to export.');
+  const wb = utils.book_new();
+  utils.book_append_sheet(wb, utils.json_to_sheet(rows), 'Expenses');
+  writeFileXLSX(wb, `household-expenses-${todayIso()}.xlsx`);
 }
 
 function backupJson() {
-  const payload = {
-    version: 3,
-    exportedAt: new Date().toISOString(),
-    householdId: state.household.id,
-    monthlyBudget: state.monthlyBudget,
-    categoryBudgets: state.categoryBudgets,
-    expenses: state.expenses,
-    incomes: state.incomes,
-    recurringExpenses: state.recurringExpenses,
-    recurringIncomes: state.recurringIncomes,
-  };
+  const payload = { exportedAt: new Date().toISOString(), monthlyBudget: state.monthlyBudget, expenses: state.expenses };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `household-finance-backup-${todayIso()}.json`;
-  document.body.appendChild(a);
+  a.download = `household-expenses-backup-${todayIso()}.json`;
   a.click();
-  a.remove();
   URL.revokeObjectURL(url);
 }
 
 async function restoreJson(file) {
   const payload = JSON.parse(await file.text());
-  if (!payload || payload.householdId !== state.household.id) throw new Error('Invalid or mismatched backup.');
-
-  if (Number.isFinite(Number(payload.monthlyBudget))) {
-    await setDoc(doc(db, 'households', HOUSEHOLD_ID), { monthlyBudget: Number(payload.monthlyBudget), updatedAt: Date.now() }, { merge: true });
-  }
-  if (Array.isArray(payload.categoryBudgets) && payload.categoryBudgets.length) {
-    await Promise.all(
-      payload.categoryBudgets.map((x) =>
-        setDoc(
-          doc(db, 'households', HOUSEHOLD_ID, 'categoryBudgets', String(x.category)),
-          { category: String(x.category), amount: Number(x.amount || 0), updatedAt: Date.now() },
-          { merge: true },
-        ),
-      ),
-    );
-  }
-  if (Array.isArray(payload.expenses) && payload.expenses.length) {
-    await Promise.all(
-      payload.expenses.map((x) => {
-        const row = {
-          amount: Number(x.amount),
-          expense_date: String(x.expense_date),
-          category: String(x.category),
-          classification: String(x.classification || 'reducible'),
-          description: String(x.description),
-          paid_by: String(x.paid_by),
-          notes: String(x.notes || ''),
-          is_irregular_annual: Boolean(x.is_irregular_annual),
-          updatedAt: Date.now(),
-        };
-        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'expenses', String(x.id)), row, { merge: true });
-        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'expenses'), { ...row, createdAt: Date.now() });
-      }),
-    );
-  }
-  if (Array.isArray(payload.incomes) && payload.incomes.length) {
-    await Promise.all(
-      payload.incomes.map((x) => {
-        const row = {
-          amount: Number(x.amount),
-          income_date: String(x.income_date),
-          source: String(x.source),
-          income_type: String(x.income_type || 'other'),
-          received_by: String(x.received_by),
-          notes: String(x.notes || ''),
-          updatedAt: Date.now(),
-        };
-        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'incomes', String(x.id)), row, { merge: true });
-        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'incomes'), { ...row, createdAt: Date.now() });
-      }),
-    );
-  }
-  if (Array.isArray(payload.recurringExpenses) && payload.recurringExpenses.length) {
-    await Promise.all(
-      payload.recurringExpenses.map((x) => {
-        const row = {
-          title: String(x.title),
-          amount: Number(x.amount),
-          category: String(x.category),
-          cadence: String(x.cadence),
-          next_due_date: String(x.next_due_date),
-          notes: String(x.notes || ''),
-          active: Boolean(x.active),
-          updatedAt: Date.now(),
-        };
-        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringExpenses', String(x.id)), row, { merge: true });
-        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringExpenses'), { ...row, createdAt: Date.now() });
-      }),
-    );
-  }
-  if (Array.isArray(payload.recurringIncomes) && payload.recurringIncomes.length) {
-    await Promise.all(
-      payload.recurringIncomes.map((x) => {
-        const row = {
-          title: String(x.title),
-          amount: Number(x.amount),
-          income_type: String(x.income_type),
-          cadence: String(x.cadence),
-          next_due_date: String(x.next_due_date),
-          received_by: String(x.received_by),
-          notes: String(x.notes || ''),
-          active: Boolean(x.active),
-          updatedAt: Date.now(),
-        };
-        if (x.id) return setDoc(doc(db, 'households', HOUSEHOLD_ID, 'recurringIncomes', String(x.id)), row, { merge: true });
-        return addDoc(collection(db, 'households', HOUSEHOLD_ID, 'recurringIncomes'), { ...row, createdAt: Date.now() });
-      }),
-    );
-  }
-}
-
-function bindScenarioEvents() {
-  const mode = document.querySelector('#scenarioMode');
-  const memberA = document.querySelector('#scenarioMemberA');
-  const memberB = document.querySelector('#scenarioMemberB');
-  const customIncome = document.querySelector('#scenarioCustomIncome');
-  const reduction = document.querySelector('#scenarioOptionalReduction');
-
-  mode.addEventListener('change', () => {
-    state.scenario.mode = mode.value;
-    renderWhatIf();
-  });
-  memberA.addEventListener('change', () => {
-    state.scenario.selectedMemberA = memberA.value;
-    renderWhatIf();
-  });
-  memberB.addEventListener('change', () => {
-    state.scenario.selectedMemberB = memberB.value;
-    renderWhatIf();
-  });
-  customIncome.addEventListener('input', () => {
-    state.scenario.customIncome = Number(customIncome.value || 0);
-    renderWhatIf();
-  });
-  reduction.addEventListener('input', () => {
-    state.scenario.optionalReductionPercent = Number(reduction.value || 0);
-    renderWhatIf();
-  });
+  if (!payload || !Array.isArray(payload.expenses)) throw new Error('Invalid backup file.');
+  state.monthlyBudget = Number(payload.monthlyBudget || 0);
+  state.expenses = payload.expenses
+    .filter((x) => Number.isFinite(Number(x.amount)) && x.expense_date && x.category && x.description && x.paid_by)
+    .map((x) => ({
+      id: x.id || crypto.randomUUID(),
+      amount: Number(x.amount),
+      expense_date: String(x.expense_date),
+      category: String(x.category),
+      classification: String(x.classification || 'reducible'),
+      description: String(x.description),
+      paid_by: String(x.paid_by),
+      notes: String(x.notes || ''),
+    }));
+  saveState();
+  renderAll();
 }
 
 function bindEvents() {
-  document.querySelector('#magicLinkForm').addEventListener('submit', (e) => handleMagicLink(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#dobForm').addEventListener('submit', (e) => handleDobVerify(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#categoryBudgetForm').addEventListener('submit', (e) => handleCategoryBudgetSave(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#expenseForm').addEventListener('submit', (e) => handleExpenseSave(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#incomeForm').addEventListener('submit', (e) => handleIncomeSave(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#recurringExpenseForm').addEventListener('submit', (e) => handleRecurringExpenseSave(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#recurringIncomeForm').addEventListener('submit', (e) => handleRecurringIncomeSave(e).catch((err) => showToast(err.message, true)));
-
-  document.querySelector('#cancelExpenseEditButton').addEventListener('click', resetExpenseForm);
-  document.querySelector('#cancelIncomeEditButton').addEventListener('click', resetIncomeForm);
-  document.querySelector('#cancelRecurringExpenseEditButton').addEventListener('click', resetRecurringForms);
-  document.querySelector('#cancelRecurringIncomeEditButton').addEventListener('click', resetRecurringForms);
-
+  document.querySelector('#unlockForm').addEventListener('submit', (e) => handleUnlock(e).catch((err) => showToast(err.message, true)));
+  document.querySelector('#expenseForm').addEventListener('submit', (e) => {
+    try {
+      handleExpenseSave(e);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+  document.querySelector('#cancelEditButton').addEventListener('click', resetExpenseForm);
   document.querySelector('#expenseTableBody').addEventListener('click', handleExpenseActions);
-  document.querySelector('#incomeTableBody').addEventListener('click', handleIncomeActions);
-  document.querySelector('#recurringExpenseList').addEventListener('click', handleRecurringActions);
-  document.querySelector('#recurringIncomeList').addEventListener('click', handleRecurringActions);
-  document.querySelector('#categoryBudgetList').addEventListener('click', handleRecurringActions);
-
+  document.querySelector('#budgetForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const value = Number(new FormData(e.target).get('budget'));
+    if (!Number.isFinite(value) || value < 0) return showToast('Enter a valid budget.', true);
+    state.monthlyBudget = value;
+    saveState();
+    renderDashboard();
+  });
   const filterForm = document.querySelector('#filterForm');
   filterForm.addEventListener('input', () => {
     state.filters.search = String(filterForm.search.value || '');
@@ -1622,87 +482,60 @@ function bindEvents() {
     state.filters = { search: '', category: '', paidBy: '', month: '' };
     renderExpensesTable();
   });
-
-  document.querySelector('#exportCsvButton').addEventListener('click', exportCsv);
-  document.querySelector('#exportExcelButton').addEventListener('click', exportExcel);
+  document.querySelector('#exportCsvButton').addEventListener('click', () => {
+    try {
+      exportCsv();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+  document.querySelector('#exportExcelButton').addEventListener('click', () => {
+    try {
+      exportExcel();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
   document.querySelector('#backupButton').addEventListener('click', backupJson);
-  document.querySelector('#restoreInput').addEventListener('change', async (event) => {
-    const file = event.target.files?.[0];
+  document.querySelector('#restoreInput').addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
     if (!file) return;
     try {
       await restoreJson(file);
-      await refreshData();
       showToast('Backup restored.');
     } catch (err) {
       showToast(err.message, true);
     } finally {
-      event.target.value = '';
+      e.target.value = '';
     }
   });
-  document.querySelector('#signOutButton').addEventListener('click', () => {
-    signOut(auth).catch((err) => showToast(err.message, true));
+  document.querySelector('#lockButton').addEventListener('click', () => {
+    state.unlocked = false;
+    state.user = '';
+    state.editingId = null;
+    sessionStorage.removeItem(SESSION_UNLOCK_KEY);
+    setVisibleView('#gateView');
   });
-
-  bindScenarioEvents();
 }
 
-async function applySession(session) {
-  const sameUser = Boolean(state.session?.uid && session?.uid && state.session.uid === session.uid);
-  state.session = session;
-  if (!session) {
-    state.dobVerified = false;
-    state.profile = null;
-    state.household = null;
-    unsubscribeFns.forEach((fn) => fn());
-    unsubscribeFns = [];
-    setVisibleView('#authView');
-    return;
-  }
-  await loadProfile();
-  await loadHousehold();
-  if (!state.household) throw new Error('No household linked to this account.');
-  if (!sameUser) state.dobVerified = false;
-  if (!state.dobVerified) {
-    setVisibleView('#dobView');
-    return;
-  }
-  await refreshData();
-  setupRealtime();
-  setVisibleView('#appView');
-}
+function main() {
+  const saved = loadJson(STORAGE_KEY, { monthlyBudget: 0, expenses: [] });
+  state.monthlyBudget = Number(saved.monthlyBudget || 0);
+  state.expenses = Array.isArray(saved.expenses) ? saved.expenses : [];
 
-async function main() {
   renderShell();
-  if (!ensureFirebaseConfigured()) return;
-  approvedUsers = parseApprovedUsers();
-  approvedByEmail = new Map(approvedUsers.map((x) => [x.email, x]));
-  if (!approvedUsers.length) {
-    throw new Error('No approved users configured. Set VITE_APPROVED_USERS_JSON in .env.local');
-  }
-  const app = initializeApp({
-    apiKey: FIREBASE_API_KEY,
-    authDomain: FIREBASE_AUTH_DOMAIN,
-    projectId: FIREBASE_PROJECT_ID,
-    appId: FIREBASE_APP_ID,
-  });
-  auth = getAuth(app);
-  db = getFirestore(app);
   bindEvents();
 
-  if (isSignInWithEmailLink(auth, window.location.href)) {
-    const email = normalizeEmail(window.localStorage.getItem('expenseTrackerEmailForSignIn'));
-    if (!email) throw new Error('Missing sign-in email on this device. Request a new magic link.');
-    await signInWithEmailLink(auth, email, window.location.href);
-    window.localStorage.removeItem('expenseTrackerEmailForSignIn');
-    window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.search}`);
+  const session = loadJson(SESSION_UNLOCK_KEY, null);
+  if (session?.user) {
+    state.user = String(session.user);
+    state.unlocked = true;
+    setVisibleView('#appView');
+    renderAll();
+    resetExpenseForm();
+  } else {
+    setVisibleView('#gateView');
   }
-
-  await applySession(auth.currentUser);
-  document.querySelector('#expenseForm input[name="expenseDate"]').value = todayIso();
-  document.querySelector('#incomeForm input[name="incomeDate"]').value = todayIso();
-  document.querySelector('#recurringExpenseForm input[name="nextDueDate"]').value = todayIso();
-  document.querySelector('#recurringIncomeForm input[name="nextDueDate"]').value = todayIso();
-  onAuthStateChanged(auth, (session) => applySession(session).catch((err) => showToast(err.message, true)));
 }
 
-main().catch((error) => showToast(error.message, true));
+main();

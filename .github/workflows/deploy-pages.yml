@@ -31,13 +31,6 @@ jobs:
         run: npm ci
 
       - name: Build
-        env:
-          VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
-          VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
-          VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
-          VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
-          VITE_HOUSEHOLD_ID: ${{ secrets.VITE_HOUSEHOLD_ID }}
-          VITE_APPROVED_USERS_JSON: ${{ secrets.VITE_APPROVED_USERS_JSON }}
         run: npm run build
 
       - name: Upload artifact

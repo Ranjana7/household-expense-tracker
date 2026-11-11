@@ -1,72 +1,42 @@
-# Household Expense Tracker
+# Household Expense Tracker (Simple Public App)
 
-Private household finance tracker for two people, hosted on **GitHub Pages** with **Firebase Auth + Firestore**.
+A lightweight household expense tracker hosted on GitHub Pages.
 
-## Why this setup
+## What this version is
 
-- Public website URL on GitHub Pages
-- Secure sign-in with email magic link
-- Firestore security rules restrict data access to only two approved emails
-- Real-time sync between both users' devices
+- Public static website (no external backend service)
+- Data saved in your browser (`localStorage`)
+- Name + DOB popup gate for basic access friction
+- Budget tracking, dashboard cards, filters, edit/delete, CSV/Excel export, JSON backup/restore
 
-## Features
+## Important limitation
 
-- Expense tracking: add/edit/delete/search/filter
-- Income tracking (salary/other)
-- Essential/reducible/optional classification
-- Dashboard with monthly totals, breakdowns, trends, and surplus/shortfall
-- "What If?" one-income planner
-- Recurring income and recurring expenses
-- Category budgets
-- EUR formatting (`en-IE`)
-- CSV/Excel export + JSON backup/restore
+This is **not secure authentication**.  
+Because this app is fully client-side/public, name + DOB checks can be bypassed by technical users.
 
-## Local setup
-
-1. Create a Firebase project.
-2. Enable **Authentication → Email link (passwordless sign-in)**.
-3. Create Firestore database (production mode).
-4. In Firestore rules, paste `firebase/firestore.rules` and replace the two placeholder emails.
-5. Copy `.env.example` to `.env.local` and fill Firebase values.
-6. Set `VITE_APPROVED_USERS_JSON` with your two approved users and DOB hashes.
-7. Run:
+## Run locally
 
 ```bash
 npm install
 npm run dev
 ```
 
-## How to generate DOB hashes (SHA-256)
+## Deploy to GitHub Pages
 
-Use format `YYYY-MM-DD` for DOB, then hash it:
+The workflow `.github/workflows/deploy-pages.yml` deploys automatically on push to `master`.
 
-```bash
-node -e "const c=require('crypto'); console.log(c.createHash('sha256').update('1990-01-31').digest('hex'))"
-```
+1. GitHub repo settings → **Pages** → Source = **GitHub Actions**
+2. Push to `master`
+3. Site URL:
+   `https://ranjana7.github.io/household-expense-tracker/`
 
-Put that hash into `VITE_APPROVED_USERS_JSON`.
+## Access popup logic
 
-## GitHub Pages deploy
+1. Enter one approved name (`Ranjana`/`Ranjana Garg` or `AK`/`AK Sharma`)
+2. In DOB field, enter **today's date**
+3. The app unlocks only when both checks match
 
-This repo includes `.github/workflows/deploy-pages.yml`.
+## Data notes
 
-1. In GitHub repo settings, enable **Pages → Source: GitHub Actions**.
-2. Add repository secrets:
-   - `VITE_FIREBASE_API_KEY`
-   - `VITE_FIREBASE_AUTH_DOMAIN`
-   - `VITE_FIREBASE_PROJECT_ID`
-   - `VITE_FIREBASE_APP_ID`
-   - `VITE_HOUSEHOLD_ID`
-   - `VITE_APPROVED_USERS_JSON`
-3. Push to `master`.
-
-Site URL format:
-
-`https://ranjana7.github.io/household-expense-tracker/`
-
-## Security model
-
-- Sign-in required (magic link).
-- Firestore rules enforce server-side email allow-list access.
-- Only the two approved emails can read/write household data.
-- No API secrets are committed in the repository.
+- Data is stored per browser/device profile.
+- Use **Backup JSON** and **Restore JSON** to move data between devices.
