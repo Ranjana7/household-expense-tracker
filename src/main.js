@@ -736,6 +736,14 @@ function renderExpenseCategoryList() {
     .join('');
 }
 
+function setVisibleView(target) {
+  const gate = document.querySelector('#gateView');
+  const app = document.querySelector('#appView');
+  if (!gate || !app) return;
+  gate.classList.toggle('hidden', target !== '#gateView');
+  app.classList.toggle('hidden', target !== '#appView');
+}
+
 function bindEvents() {
   document.querySelector('#unlockForm').addEventListener('submit', async (e) => {
     e.preventDefault();
