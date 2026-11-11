@@ -11,6 +11,36 @@ const ALLOWED_NAME_HASHES = new Set([
   '105a112c81ce60e646c007e98655b7caa27d9e6f36a7ba9584e406dd400e15ff',
   'a13e93f0c837098185bc6189f34f9975910089c0d2af201b47bb4514cb905e23',
 ]);
+const CUSTOM_CATEGORY_VALUE = '__custom__';
+const EXPENSE_CATEGORIES = [
+  'Housing',
+  'Utilities',
+  'Groceries',
+  'Transport',
+  'Insurance',
+  'Healthcare',
+  'Education',
+  'Childcare',
+  'Maintenance',
+  'Taxes',
+  'Shopping',
+  'Dining',
+  'Entertainment',
+  'Travel',
+  'Other',
+];
+const INCOME_CATEGORIES = [
+  'Salary',
+  'Rental Income',
+  'Bonus',
+  'Freelance',
+  'Business',
+  'Interest',
+  'Dividends',
+  'Pension',
+  'Gift',
+  'Other',
+];
 const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
 const EXPENSE_TYPES = ['mandatory', 'avoidable'];
 const INCOME_TYPES = ['permanent', 'temporary'];
@@ -71,6 +101,10 @@ function formatCurrency(value) {
 
 function formatDate(value) {
   return new Intl.DateTimeFormat(LOCALE).format(new Date(`${value}T00:00:00`));
+}
+
+function toOptions(values) {
+  return values.map((x) => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
 }
 
 async function sha256Hex(value) {
@@ -402,8 +436,11 @@ function resetExpenseForm() {
   form.reset();
   form.expenseDate.value = todayIso();
   form.expenseFrequency.value = 'monthly';
+  form.expenseCategoryPreset.value = EXPENSE_CATEGORIES[0];
+  form.expenseCategoryCustom.value = '';
   form.expenseType.value = 'mandatory';
-  form.expenseRecurring.value = 'yes';
+  form.recurring.value = 'yes';
+  toggleCustomCategory('expense');
   document.querySelector('#saveExpenseButton').textContent = 'Save expense';
   document.querySelector('#cancelExpenseEditButton').classList.add('hidden');
 }
@@ -414,10 +451,41 @@ function resetIncomeForm() {
   form.reset();
   form.incomeDate.value = todayIso();
   form.incomeFrequency.value = 'monthly';
+  form.incomeCategoryPreset.value = INCOME_CATEGORIES[0];
+  form.incomeCategoryCustom.value = '';
   form.incomeType.value = 'permanent';
-  form.incomeRecurring.value = 'yes';
+  form.recurring.value = 'yes';
+  toggleCustomCategory('income');
   document.querySelector('#saveIncomeButton').textContent = 'Save income';
   document.querySelector('#cancelIncomeEditButton').classList.add('hidden');
+}
+
+function toggleCustomCategory(kind) {
+  const preset = document.querySelector(
+    kind === 'expense' ? '#expenseCategoryPreset' : '#incomeCategoryPreset',
+  );
+  const wrap = document.querySelector(
+    kind === 'expense' ? '#expenseCategoryCustomWrap' : '#incomeCategoryCustomWrap',
+  );
+  const input = document.querySelector(
+    kind === 'expense' ? '#expenseCategoryCustom' : '#incomeCategoryCustom',
+  );
+  const isCustom = preset.value === CUSTOM_CATEGORY_VALUE;
+  wrap.classList.toggle('hidden', !isCustom);
+  input.required = isCustom;
+  if (!isCustom) input.value = '';
+}
+
+function resolveCategory(form, kind) {
+  const preset = String(
+    form.get(kind === 'expense' ? 'expenseCategoryPreset' : 'incomeCategoryPreset') || '',
+  ).trim();
+  if (preset && preset !== CUSTOM_CATEGORY_VALUE) return preset;
+  const custom = String(
+    form.get(kind === 'expense' ? 'expenseCategoryCustom' : 'incomeCategoryCustom') || '',
+  ).trim();
+  if (!custom) throw new Error('Enter a category.');
+  return custom;
 }
 
 async function handleSaveExpense(event) {
@@ -428,7 +496,7 @@ async function handleSaveExpense(event) {
     amount: Number(form.get('amount')),
     date: String(form.get('expenseDate')),
     frequency: String(form.get('expenseFrequency')),
-    category: String(form.get('category')).trim() || 'Other',
+    category: resolveCategory(form, 'expense'),
     expenseType: String(form.get('expenseType')),
     recurring: String(form.get('recurring')) === 'yes',
     note: String(form.get('note') || '').trim(),
@@ -454,7 +522,7 @@ async function handleSaveIncome(event) {
     amount: Number(form.get('amount')),
     date: String(form.get('incomeDate')),
     frequency: String(form.get('incomeFrequency')),
-    category: String(form.get('category')).trim() || 'Other',
+    category: resolveCategory(form, 'income'),
     relatesToExpense: String(form.get('relatesToExpense') || '').trim(),
     incomeType: String(form.get('incomeType')),
     recurring: String(form.get('recurring')) === 'yes',
@@ -482,10 +550,17 @@ function editExpense(id) {
   form.amount.value = row.amount.toFixed(2);
   form.expenseDate.value = row.date;
   form.expenseFrequency.value = row.frequency;
-  form.category.value = row.category;
+  if (EXPENSE_CATEGORIES.includes(row.category)) {
+    form.expenseCategoryPreset.value = row.category;
+    form.expenseCategoryCustom.value = '';
+  } else {
+    form.expenseCategoryPreset.value = CUSTOM_CATEGORY_VALUE;
+    form.expenseCategoryCustom.value = row.category;
+  }
   form.expenseType.value = row.expenseType;
   form.recurring.value = row.recurring ? 'yes' : 'no';
   form.note.value = row.note || '';
+  toggleCustomCategory('expense');
   document.querySelector('#saveExpenseButton').textContent = 'Update expense';
   document.querySelector('#cancelExpenseEditButton').classList.remove('hidden');
 }
@@ -500,11 +575,18 @@ function editIncome(id) {
   form.amount.value = row.amount.toFixed(2);
   form.incomeDate.value = row.date;
   form.incomeFrequency.value = row.frequency;
-  form.category.value = row.category;
+  if (INCOME_CATEGORIES.includes(row.category)) {
+    form.incomeCategoryPreset.value = row.category;
+    form.incomeCategoryCustom.value = '';
+  } else {
+    form.incomeCategoryPreset.value = CUSTOM_CATEGORY_VALUE;
+    form.incomeCategoryCustom.value = row.category;
+  }
   form.relatesToExpense.value = row.relatesToExpense || '';
   form.incomeType.value = row.incomeType;
   form.recurring.value = row.recurring ? 'yes' : 'no';
   form.note.value = row.note || '';
+  toggleCustomCategory('income');
   document.querySelector('#saveIncomeButton').textContent = 'Update income';
   document.querySelector('#cancelIncomeEditButton').classList.remove('hidden');
 }
@@ -674,7 +756,13 @@ function renderShell() {
             <label>Amount <input name="amount" type="number" min="0.01" step="0.01" required /></label>
             <label>Expense date <input name="expenseDate" type="date" required /></label>
             <label>Frequency <select name="expenseFrequency">${FREQUENCIES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
-            <label>Category <input name="category" required maxlength="60" /></label>
+            <label>Category
+              <select id="expenseCategoryPreset" name="expenseCategoryPreset">
+                ${toOptions(EXPENSE_CATEGORIES)}
+                <option value="${CUSTOM_CATEGORY_VALUE}">Other (type your own)</option>
+              </select>
+            </label>
+            <label id="expenseCategoryCustomWrap" class="hidden">Custom category <input id="expenseCategoryCustom" name="expenseCategoryCustom" maxlength="60" /></label>
             <label>Mandatory or Avoidable <select name="expenseType">${EXPENSE_TYPES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
             <label>Recurring <select name="recurring"><option value="yes">Yes</option><option value="no">No</option></select></label>
             <label class="wide">Optional note <textarea name="note" maxlength="300"></textarea></label>
@@ -696,7 +784,13 @@ function renderShell() {
             <label>Amount <input name="amount" type="number" min="0.01" step="0.01" required /></label>
             <label>Income date <input name="incomeDate" type="date" required /></label>
             <label>Frequency <select name="incomeFrequency">${FREQUENCIES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
-            <label>Category <input name="category" required maxlength="60" /></label>
+            <label>Category
+              <select id="incomeCategoryPreset" name="incomeCategoryPreset">
+                ${toOptions(INCOME_CATEGORIES)}
+                <option value="${CUSTOM_CATEGORY_VALUE}">Other (type your own)</option>
+              </select>
+            </label>
+            <label id="incomeCategoryCustomWrap" class="hidden">Custom category <input id="incomeCategoryCustom" name="incomeCategoryCustom" maxlength="60" /></label>
             <label>Relates to Expense (optional) <input name="relatesToExpense" maxlength="60" list="expenseCategoryList" /></label>
             <label>Permanent or Temporary <select name="incomeType">${INCOME_TYPES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
             <label>Recurring <select name="recurring"><option value="yes">Yes</option><option value="no">No</option></select></label>
@@ -789,6 +883,8 @@ function bindEvents() {
   );
   document.querySelector('#cancelExpenseEditButton').addEventListener('click', resetExpenseForm);
   document.querySelector('#cancelIncomeEditButton').addEventListener('click', resetIncomeForm);
+  document.querySelector('#expenseCategoryPreset').addEventListener('change', () => toggleCustomCategory('expense'));
+  document.querySelector('#incomeCategoryPreset').addEventListener('change', () => toggleCustomCategory('income'));
 
   document.querySelector('#expenseTableBody').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-action]');
