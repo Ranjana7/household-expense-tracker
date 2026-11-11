@@ -13,6 +13,11 @@ const ALLOWED_NAME_HASHES = new Set([
 ]);
 const CUSTOM_CATEGORY_VALUE = '__custom__';
 const EXPENSE_CATEGORIES = [
+  'Mortgage-S',
+  'Mortgage-P',
+  'Mortgage-A',
+  'Mortgage-ES',
+  'Mortgage-PT',
   'Housing',
   'Utilities',
   'Groceries',
