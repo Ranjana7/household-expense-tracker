@@ -6,6 +6,13 @@ create table if not exists public.profiles (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.authorized_users (
+  email text primary key check (position('@' in email) > 1),
+  display_name text not null check (char_length(display_name) between 1 and 80),
+  dob_hash text not null check (char_length(dob_hash) = 64),
+  created_at timestamptz not null default now()
+);
+
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
@@ -27,6 +34,34 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
 after insert on auth.users
 for each row execute function public.handle_new_user();
+
+create or replace function public.enforce_authorized_user_email()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+begin
+  if new.email is null then
+    raise exception 'Email sign-in is required';
+  end if;
+
+  if not exists (
+    select 1
+    from public.authorized_users au
+    where lower(au.email) = lower(new.email)
+  ) then
+    raise exception 'This email is not authorised for this household tracker';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists enforce_authorized_user_email on auth.users;
+create trigger enforce_authorized_user_email
+before insert on auth.users
+for each row execute function public.enforce_authorized_user_email();
 
 create table if not exists public.households (
   id uuid primary key default gen_random_uuid(),
@@ -227,6 +262,105 @@ begin
 end;
 $$;
 
+create or replace function public.bootstrap_household_for_authorized_user(p_household_name text default 'Our Household')
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  user_email text;
+  authorized_name text;
+  existing_household_id uuid;
+  members_count integer;
+begin
+  if auth.uid() is null then raise exception 'Authentication required'; end if;
+
+  select lower(u.email) into user_email
+  from auth.users u
+  where u.id = auth.uid();
+
+  select au.display_name into authorized_name
+  from public.authorized_users au
+  where lower(au.email) = user_email;
+
+  if authorized_name is null then
+    raise exception 'This account is not authorised for this household tracker';
+  end if;
+
+  update public.profiles
+  set display_name = authorized_name
+  where user_id = auth.uid() and display_name <> authorized_name;
+
+  select hm.household_id into existing_household_id
+  from public.household_members hm
+  where hm.user_id = auth.uid()
+  limit 1;
+
+  if existing_household_id is not null then
+    return existing_household_id;
+  end if;
+
+  select h.id into existing_household_id
+  from public.households h
+  order by h.created_at
+  limit 1;
+
+  if existing_household_id is null then
+    insert into public.households (name, created_by)
+    values (coalesce(nullif(trim(p_household_name), ''), 'Our Household'), auth.uid())
+    returning id into existing_household_id;
+
+    insert into public.monthly_budgets (household_id, amount_eur)
+    values (existing_household_id, 0)
+    on conflict (household_id) do nothing;
+  end if;
+
+  select count(*) into members_count
+  from public.household_members
+  where household_id = existing_household_id;
+
+  if members_count >= 2 then
+    raise exception 'This household already has two authorised users';
+  end if;
+
+  insert into public.household_members (household_id, user_id)
+  values (existing_household_id, auth.uid())
+  on conflict do nothing;
+
+  return existing_household_id;
+end;
+$$;
+
+create or replace function public.verify_access_dob(p_dob date)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  user_email text;
+  expected_hash text;
+begin
+  if auth.uid() is null then raise exception 'Authentication required'; end if;
+  if p_dob is null then return false; end if;
+
+  select lower(u.email) into user_email
+  from auth.users u
+  where u.id = auth.uid();
+
+  select au.dob_hash into expected_hash
+  from public.authorized_users au
+  where lower(au.email) = user_email;
+
+  if expected_hash is null then
+    return false;
+  end if;
+
+  return expected_hash = encode(digest(p_dob::text, 'sha256'), 'hex');
+end;
+$$;
+
 alter table public.profiles enable row level security;
 alter table public.households enable row level security;
 alter table public.household_members enable row level security;
@@ -346,3 +480,9 @@ revoke all on function public.create_household(text, numeric) from public;
 grant execute on function public.create_household(text, numeric) to authenticated;
 revoke all on function public.join_household(text) from public;
 grant execute on function public.join_household(text) to authenticated;
+revoke all on function public.bootstrap_household_for_authorized_user(text) from public;
+grant execute on function public.bootstrap_household_for_authorized_user(text) to authenticated;
+revoke all on function public.verify_access_dob(date) from public;
+grant execute on function public.verify_access_dob(date) to authenticated;
+
+revoke all on table public.authorized_users from anon, authenticated;

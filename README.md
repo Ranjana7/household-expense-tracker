@@ -6,7 +6,7 @@ A mobile-friendly shared household expense tracker for two authenticated users, 
 
 This project uses a static JavaScript frontend and Supabase backend instead of Node.js/Spring because it is the simplest maintainable option that still gives:
 
-- Separate sign-in per person
+- Separate sign-in per person (email magic link)
 - Shared real-time-ish cloud data
 - Strong database-level access controls (RLS)
 - No custom backend server to maintain
@@ -47,8 +47,8 @@ This project uses a static JavaScript frontend and Supabase backend instead of N
 1. Create a Supabase project.
 2. In Supabase SQL editor, run `supabase/schema.sql`.
 3. In Supabase Auth settings:
-   - Enable Email/Password provider.
-   - Set email confirmation as you prefer (on/off).
+   - Enable **Email** provider (magic link / OTP).
+   - Disable unused providers if desired.
 4. Copy `.env.example` to `.env.local` and fill:
 
 ```bash
@@ -63,16 +63,30 @@ npm install
 npm run dev
 ```
 
-6. Open the app, create 2 user accounts, then:
-   - First account: create household.
-   - Second account: join with invite code shown in the app.
+6. In Supabase SQL editor, register exactly two approved users (replace values):
+
+```sql
+insert into public.authorized_users (email, display_name, dob_hash)
+values
+  ('you@example.com', 'Your Name', encode(digest('1990-01-31', 'sha256'), 'hex')),
+  ('husband@example.com', 'Husband Name', encode(digest('1989-06-12', 'sha256'), 'hex'))
+on conflict (email) do update
+set display_name = excluded.display_name,
+    dob_hash = excluded.dob_hash;
+```
+
+7. Open the app:
+   - Enter one approved email and request a magic link.
+   - Open the magic link from email.
+   - Enter DOB to unlock the dashboard.
 
 ## Security model
 
-- App access requires sign-in.
+- App access requires sign-in via email magic link.
+- Only emails listed in `public.authorized_users` can create sessions.
 - Supabase RLS policies enforce that only household members can read/write household incomes, expenses, recurring items, and budgets.
 - Data isolation is enforced in database policies, not hidden frontend routes.
-- Join flow enforces max two authorized household members.
+- Bootstrap flow enforces max two authorized household members.
 - No service-role keys are used in frontend.
 
 ## Backup/restore

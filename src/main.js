@@ -17,9 +17,9 @@ const CURRENCY = 'EUR';
 
 const state = {
   session: null,
+  dobVerified: false,
   profile: null,
   household: null,
-  inviteCode: '',
   members: [],
   expenses: [],
   incomes: [],
@@ -52,41 +52,21 @@ function renderShell() {
 
       <section id="authView" class="card">
         <h1>Household Expense Tracker</h1>
-        <p class="muted">Simple, secure household cash-flow tracker. No bank integrations or card/account data.</p>
-        <div class="split">
-          <form id="signInForm" class="stack">
-            <h2>Sign in</h2>
-            <label>Email<input name="email" type="email" required autocomplete="email" /></label>
-            <label>Password<input name="password" type="password" required autocomplete="current-password" /></label>
-            <button type="submit">Sign in</button>
-          </form>
-          <form id="signUpForm" class="stack">
-            <h2>Create account</h2>
-            <label>Name<input name="displayName" type="text" required maxlength="50" /></label>
-            <label>Email<input name="email" type="email" required autocomplete="email" /></label>
-            <label>Password<input name="password" type="password" required minlength="8" autocomplete="new-password" /></label>
-            <button type="submit">Create account</button>
-          </form>
-        </div>
+        <p class="muted">Private household tracker for two approved users. Sign in with your approved email to receive a one-time magic link.</p>
+        <form id="magicLinkForm" class="stack">
+          <label>Approved email<input name="email" type="email" required autocomplete="email" /></label>
+          <button type="submit">Send magic link</button>
+        </form>
       </section>
 
-      <section id="onboardingView" class="hidden">
+      <section id="dobView" class="hidden">
         <div class="card">
-          <h2>Set up your household</h2>
-          <p class="muted">Create a household, then let your husband join via invite code. Max 2 authorised users.</p>
-          <div class="split">
-            <form id="createHouseholdForm" class="stack">
-              <h3>Create household</h3>
-              <label>Household name<input name="name" required maxlength="80" /></label>
-              <label>Optional monthly budget (EUR)<input name="budget" type="number" min="0" step="0.01" value="0" /></label>
-              <button type="submit">Create</button>
-            </form>
-            <form id="joinHouseholdForm" class="stack">
-              <h3>Join household</h3>
-              <label>Invite code<input name="code" required maxlength="20" /></label>
-              <button type="submit">Join</button>
-            </form>
-          </div>
+          <h2>Confirm date of birth</h2>
+          <p class="muted">Enter your DOB to open the household dashboard.</p>
+          <form id="dobForm" class="stack">
+            <label>Date of birth<input name="dob" type="date" required /></label>
+            <button type="submit">Continue</button>
+          </form>
         </div>
       </section>
 
@@ -94,7 +74,7 @@ function renderShell() {
         <div class="card topbar">
           <div>
             <h2 id="householdTitle"></h2>
-            <p class="muted">Signed in as <strong id="signedInName"></strong>. Invite code: <code id="inviteCodeText"></code></p>
+            <p class="muted">Signed in as <strong id="signedInName"></strong></p>
           </div>
           <button id="signOutButton" class="secondary">Sign out</button>
         </div>
@@ -384,7 +364,7 @@ function escapeHtml(value) {
 }
 
 function setVisibleView(view) {
-  ['#authView', '#onboardingView', '#appView'].forEach((id) => document.querySelector(id).classList.add('hidden'));
+  ['#authView', '#dobView', '#appView'].forEach((id) => document.querySelector(id).classList.add('hidden'));
   document.querySelector(view).classList.remove('hidden');
 }
 
@@ -416,16 +396,12 @@ async function loadHousehold() {
   if (error) throw error;
   if (!membership) {
     state.household = null;
-    state.inviteCode = '';
     return;
   }
   const householdId = membership.household_id;
   const { data: household, error: householdError } = await supabase.from('households').select('id, name').eq('id', householdId).single();
   if (householdError) throw householdError;
   state.household = household;
-  const { data: invite, error: inviteError } = await supabase.from('household_invites').select('invite_code').eq('household_id', householdId).maybeSingle();
-  if (inviteError) throw inviteError;
-  state.inviteCode = invite?.invite_code || '';
 }
 
 async function loadMembers() {
@@ -915,7 +891,6 @@ function resetRecurringForms() {
 function renderHeader() {
   document.querySelector('#householdTitle').textContent = state.household?.name || '';
   document.querySelector('#signedInName').textContent = state.profile?.display_name || '';
-  document.querySelector('#inviteCodeText').textContent = state.inviteCode || 'Unavailable';
 }
 
 function renderAll() {
@@ -955,50 +930,31 @@ function setupRealtime() {
     .subscribe();
 }
 
-async function handleSignIn(event) {
+async function handleMagicLink(event) {
   event.preventDefault();
   const form = new FormData(event.target);
-  const { error } = await supabase.auth.signInWithPassword({
-    email: String(form.get('email')).trim(),
-    password: String(form.get('password')),
+  const email = String(form.get('email')).trim().toLowerCase();
+  if (!email) throw new Error('Enter your approved email address.');
+  const { error } = await supabase.auth.signInWithOtp({
+    email,
+    options: {
+      shouldCreateUser: true,
+      emailRedirectTo: window.location.origin,
+    },
   });
   if (error) throw error;
+  showToast('Magic link sent. Open it from your email on this device.');
 }
 
-async function handleSignUp(event) {
+async function handleDobVerify(event) {
   event.preventDefault();
   const form = new FormData(event.target);
-  const displayName = String(form.get('displayName')).trim();
-  const { error } = await supabase.auth.signUp({
-    email: String(form.get('email')).trim(),
-    password: String(form.get('password')),
-    options: { data: { display_name: displayName } },
-  });
+  const dob = String(form.get('dob') || '');
+  if (!dob) throw new Error('Enter your date of birth.');
+  const { data, error } = await supabase.rpc('verify_access_dob', { p_dob: dob });
   if (error) throw error;
-  showToast('Account created. Confirm email if prompted, then sign in.');
-}
-
-async function handleCreateHousehold(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const budget = Number(form.get('budget'));
-  const { error } = await supabase.rpc('create_household', {
-    p_name: String(form.get('name')).trim(),
-    p_budget: Number.isFinite(budget) ? budget : 0,
-  });
-  if (error) throw error;
-  await loadHousehold();
-  await refreshData();
-  setupRealtime();
-  setVisibleView('#appView');
-}
-
-async function handleJoinHousehold(event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const { error } = await supabase.rpc('join_household', { p_code: String(form.get('code')).trim() });
-  if (error) throw error;
-  await loadHousehold();
+  if (!data) throw new Error('DOB does not match the approved profile.');
+  state.dobVerified = true;
   await refreshData();
   setupRealtime();
   setVisibleView('#appView');
@@ -1520,10 +1476,8 @@ function bindScenarioEvents() {
 }
 
 function bindEvents() {
-  document.querySelector('#signInForm').addEventListener('submit', (e) => handleSignIn(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#signUpForm').addEventListener('submit', (e) => handleSignUp(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#createHouseholdForm').addEventListener('submit', (e) => handleCreateHousehold(e).catch((err) => showToast(err.message, true)));
-  document.querySelector('#joinHouseholdForm').addEventListener('submit', (e) => handleJoinHousehold(e).catch((err) => showToast(err.message, true)));
+  document.querySelector('#magicLinkForm').addEventListener('submit', (e) => handleMagicLink(e).catch((err) => showToast(err.message, true)));
+  document.querySelector('#dobForm').addEventListener('submit', (e) => handleDobVerify(e).catch((err) => showToast(err.message, true)));
   document.querySelector('#categoryBudgetForm').addEventListener('submit', (e) => handleCategoryBudgetSave(e).catch((err) => showToast(err.message, true)));
   document.querySelector('#expenseForm').addEventListener('submit', (e) => handleExpenseSave(e).catch((err) => showToast(err.message, true)));
   document.querySelector('#incomeForm').addEventListener('submit', (e) => handleIncomeSave(e).catch((err) => showToast(err.message, true)));
@@ -1579,8 +1533,10 @@ function bindEvents() {
 }
 
 async function applySession(session) {
+  const sameUser = Boolean(state.session?.user?.id && session?.user?.id && state.session.user.id === session.user.id);
   state.session = session;
   if (!session) {
+    state.dobVerified = false;
     state.profile = null;
     state.household = null;
     if (householdChannel) {
@@ -1591,9 +1547,13 @@ async function applySession(session) {
     return;
   }
   await loadProfile();
+  const { error: bootstrapError } = await supabase.rpc('bootstrap_household_for_authorized_user', { p_household_name: 'Our Household' });
+  if (bootstrapError) throw bootstrapError;
   await loadHousehold();
-  if (!state.household) {
-    setVisibleView('#onboardingView');
+  if (!state.household) throw new Error('No household linked to this account.');
+  if (!sameUser) state.dobVerified = false;
+  if (!state.dobVerified) {
+    setVisibleView('#dobView');
     return;
   }
   await refreshData();
