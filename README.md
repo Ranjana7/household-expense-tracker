@@ -1,67 +1,83 @@
-# Household Finance Tracker (GitHub Pages only)
+# Household Finance Tracker
 
-Simple household income/expense tracker with four tabs:
-- Dashboard
-- Transactions
-- Financial Groups
-- What If?
+Single-page household finance tracker with:
+- Monthly/yearly dashboard
+- Two tabs only: **Add Expense** and **Add Income**
+- Playful welcome screen (name + DOB=today), explicitly not authentication
 
-## Plain data/storage facts
+## Entry fields
 
-- This app is hosted as static files on GitHub Pages.
-- **Entries are saved in browser local storage on each device**.
-- It does **not** auto-sync between devices.
-- Your data is **not** committed to the repository unless you manually export and commit it.
-- Use **Backup JSON** and **Restore JSON** to move/recover data.
+### Add Expense
+- Amount
+- Expense date (defaults to today)
+- Frequency: weekly / monthly / yearly
+- Category
+- Mandatory or avoidable
+- Recurring: yes/no
+- Optional note
 
-## Access screen
+### Add Income
+- Amount
+- Income date (defaults to today)
+- Frequency: weekly / monthly / yearly
+- Category
+- Relates to Expense (optional text)
+- Permanent or temporary
+- Recurring: yes/no
+- Optional note
 
-- Playful entry screen asks for name and "DOB".
-- Expected DOB is today's date.
-- This is **not security/authentication**.
+## Dashboard metrics
 
-## Features
+- Monthly household income
+- Gross expenses
+- Income linked to expenses
+- Net expenses after linked income
+- Remaining household income
+- Mandatory vs avoidable expenses
+- Monthly/yearly toggle
 
-- Two quick actions: **Add Income** and **Add Expense**
-- Entry fields:
-  - amount
-  - date
-  - category
-  - frequency
-  - optional note/description
-  - optional financial group
-- Frequencies:
-  - one-time
-  - weekly
-  - monthly
-  - quarterly
-  - yearly
-  - custom-months (for irregular month-specific income/expense)
-- Start/end dates for recurring entries
-- Financial groups to link items (for example rental income + mortgage + maintenance)
-- Expense classes: mandatory, reducible, optional
-- Separate:
-  - **Actual cash flow** (when money really arrives/leaves)
-  - **Normalised monthly view** (planning averages)
-- What-if planner:
-  - remove income streams
-  - override income values
-  - reduce optional expenses
-  - see monthly/annual surplus/shortfall without changing stored entries
-- CSV/Excel export and JSON backup/restore
+Linked-income rule:
+- Linked income reduces the effective cost of related expenses
+- Household balance avoids double-counting:
+  - `remaining household income = total income - gross expenses`
+  - linked income is shown separately and used only for net-expense view
 
-## Run locally
+## Recurrence behavior
+
+- Recurring entries repeat by selected frequency
+- Non-recurring entries appear once
+- Temporary recurring income is not projected beyond today
+
+## GitHub-centric sync architecture support
+
+The frontend supports two data modes:
+
+1. **Shared sync mode** (for two-user live updates)
+   - Set `VITE_SYNC_API_BASE_URL` at build time
+   - Frontend reads/writes through secure API endpoint
+   - Includes conflict-safe writes using revision checks (`If-Match`)
+   - Polls for updates and refreshes shared data automatically
+
+2. **Local fallback mode**
+   - If API URL is not configured, data is saved to browser local storage
+   - No automatic cross-device sync
+
+## Backup and recovery
+
+- Export JSON / CSV / Excel
+- Restore JSON backup into the app
+
+## Local run
 
 ```bash
 npm install
 npm run dev
 ```
 
-## Deploy to GitHub Pages
+## GitHub Pages deployment
 
-This repo includes `.github/workflows/deploy-pages.yml`.
-
-1. GitHub repo settings -> Pages -> Source = GitHub Actions
+1. Settings -> Pages -> Source = GitHub Actions
 2. Push to `master`
 3. Live URL:
    `https://ranjana7.github.io/household-expense-tracker/`
+

@@ -1,39 +1,52 @@
 import { utils, writeFileXLSX } from 'xlsx';
 import './style.css';
 
-const STORAGE_KEY = 'household-finance-v2';
-const SESSION_UNLOCK_KEY = 'household-finance-session-v2';
+const STORAGE_KEY = 'household-finance-local-v3';
+const SESSION_UNLOCK_KEY = 'household-finance-session-v3';
+const SYNC_API_BASE = import.meta.env.VITE_SYNC_API_BASE_URL || '';
 const APPROVED_NAMES = ['ranjana', 'ranjana garg', 'ak', 'ak sharma'];
 const LOCALE = 'en-IE';
 const CURRENCY = 'EUR';
-const FREQUENCIES = ['one-time', 'weekly', 'monthly', 'quarterly', 'yearly', 'custom-months'];
-const EXPENSE_CLASSES = ['mandatory', 'reducible', 'optional'];
-const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-const DEFAULT_DATA = {
-  monthlyBudget: 0,
-  categories: ['Groceries', 'Utilities', 'Mortgage', 'Insurance', 'Maintenance', 'Salary', 'Rental Income', 'Subscriptions', 'Transport', 'Other'],
-  groups: [
-    { id: 'general-household', name: 'General Household' },
-    { id: 'main-residence', name: 'Main Residence' },
-    { id: 'rental-property-1', name: 'Rental Property 1' },
-  ],
-  transactions: [],
-};
+const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
+const EXPENSE_TYPES = ['mandatory', 'avoidable'];
+const INCOME_TYPES = ['permanent', 'temporary'];
 
 const state = {
   user: '',
   unlocked: false,
-  tab: 'dashboard',
-  data: structuredClone(DEFAULT_DATA),
-  filters: { q: '', type: '', groupId: '', month: '' },
-  editingId: null,
-  scenario: {
-    removedIncomeIds: [],
-    incomeOverrides: {},
-    optionalReductionPct: 0,
+  activeTab: 'expense',
+  data: {
+    revision: null,
+    expenses: [],
+    incomes: [],
   },
+  view: {
+    mode: 'monthly',
+    month: todayMonth(),
+    year: String(new Date().getFullYear()),
+  },
+  syncStatus: SYNC_API_BASE ? 'Connected' : 'Local only',
+  editingExpenseId: null,
+  editingIncomeId: null,
+  pollHandle: null,
 };
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function todayMonth() {
+  return todayIso().slice(0, 7);
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
 
 function loadJson(key, fallback) {
   try {
@@ -44,33 +57,29 @@ function loadJson(key, fallback) {
   }
 }
 
-function saveData() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state.data));
-}
-
 function formatCurrency(value) {
   return new Intl.NumberFormat(LOCALE, { style: 'currency', currency: CURRENCY }).format(Number(value || 0));
 }
 
-function formatDate(iso) {
-  return new Intl.DateTimeFormat(LOCALE).format(new Date(`${iso}T00:00:00`));
+function formatDate(value) {
+  return new Intl.DateTimeFormat(LOCALE).format(new Date(`${value}T00:00:00`));
 }
 
-function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+function showToast(message, isError = false) {
+  const el = document.querySelector('#toast');
+  el.classList.remove('hidden', 'danger');
+  if (isError) el.classList.add('danger');
+  el.textContent = message;
+  setTimeout(() => {
+    el.classList.add('hidden');
+    el.classList.remove('danger');
+  }, 3000);
 }
 
-function monthKey(iso) {
-  return String(iso).slice(0, 7);
-}
-
-function escapeHtml(value) {
-  return String(value || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
+function setSyncStatus(text) {
+  state.syncStatus = text;
+  const el = document.querySelector('#syncStatus');
+  if (el) el.textContent = text;
 }
 
 function parseIsoDate(iso) {
@@ -93,841 +102,444 @@ function addMonths(date, months) {
   return d;
 }
 
-function endOfMonth(ym) {
-  const [year, month] = ym.split('-').map(Number);
-  const d = new Date(year, month, 0);
-  return d.toISOString().slice(0, 10);
+function inRange(dateIso, startIso, endIso) {
+  return dateIso >= startIso && dateIso <= endIso;
 }
 
-function dateInRange(iso, startIso, endIso) {
-  if (startIso && iso < startIso) return false;
-  if (endIso && iso > endIso) return false;
-  return true;
+function startAndEndForView() {
+  if (state.view.mode === 'monthly') {
+    const start = `${state.view.month}-01`;
+    const [y, m] = state.view.month.split('-').map(Number);
+    const end = new Date(y, m, 0).toISOString().slice(0, 10);
+    return { start, end };
+  }
+  return { start: `${state.view.year}-01-01`, end: `${state.view.year}-12-31` };
 }
 
-function normaliseTransaction(raw) {
+function normaliseExpense(raw) {
   return {
     id: raw.id || crypto.randomUUID(),
-    type: raw.type === 'income' ? 'income' : 'expense',
     amount: Number(raw.amount || 0),
-    category: String(raw.category || 'Other'),
-    groupId: String(raw.groupId || 'general-household'),
     date: String(raw.date || todayIso()),
-    frequency: FREQUENCIES.includes(raw.frequency) ? raw.frequency : 'one-time',
-    startDate: raw.startDate ? String(raw.startDate) : '',
-    endDate: raw.endDate ? String(raw.endDate) : '',
-    customMonths: Array.isArray(raw.customMonths) ? raw.customMonths.map(Number).filter((x) => x >= 1 && x <= 12) : [],
-    classification: EXPENSE_CLASSES.includes(raw.classification) ? raw.classification : 'reducible',
-    description: String(raw.description || ''),
+    frequency: FREQUENCIES.includes(raw.frequency) ? raw.frequency : 'monthly',
+    category: String(raw.category || 'Other'),
+    expenseType: EXPENSE_TYPES.includes(raw.expenseType) ? raw.expenseType : 'avoidable',
+    recurring: Boolean(raw.recurring),
+    note: String(raw.note || ''),
     createdAt: Number(raw.createdAt || Date.now()),
   };
 }
 
-function migrateData(oldData) {
-  if (!oldData || typeof oldData !== 'object') return structuredClone(DEFAULT_DATA);
-  if (Array.isArray(oldData.transactions)) {
-    return {
-      monthlyBudget: Number(oldData.monthlyBudget || 0),
-      categories: Array.isArray(oldData.categories) && oldData.categories.length ? oldData.categories.map(String) : structuredClone(DEFAULT_DATA.categories),
-      groups: Array.isArray(oldData.groups) && oldData.groups.length ? oldData.groups.map((g) => ({ id: String(g.id), name: String(g.name) })) : structuredClone(DEFAULT_DATA.groups),
-      transactions: oldData.transactions.map(normaliseTransaction).filter((t) => t.amount > 0),
-    };
-  }
-
-  const legacyExpenses = Array.isArray(oldData.expenses) ? oldData.expenses : [];
+function normaliseIncome(raw) {
   return {
-    monthlyBudget: Number(oldData.monthlyBudget || 0),
-    categories: structuredClone(DEFAULT_DATA.categories),
-    groups: structuredClone(DEFAULT_DATA.groups),
-    transactions: legacyExpenses.map((x) =>
-      normaliseTransaction({
-        id: x.id,
-        type: 'expense',
-        amount: x.amount,
-        category: x.category || 'Other',
-        groupId: 'general-household',
-        date: x.expense_date || todayIso(),
-        frequency: 'one-time',
-        classification: x.classification || 'reducible',
-        description: x.description || x.notes || '',
-        createdAt: Date.now(),
-      }),
-    ),
+    id: raw.id || crypto.randomUUID(),
+    amount: Number(raw.amount || 0),
+    date: String(raw.date || todayIso()),
+    frequency: FREQUENCIES.includes(raw.frequency) ? raw.frequency : 'monthly',
+    category: String(raw.category || 'Other'),
+    relatesToExpense: String(raw.relatesToExpense || '').trim(),
+    incomeType: INCOME_TYPES.includes(raw.incomeType) ? raw.incomeType : 'permanent',
+    recurring: Boolean(raw.recurring),
+    note: String(raw.note || ''),
+    createdAt: Number(raw.createdAt || Date.now()),
   };
 }
 
-function showToast(message, isError = false) {
-  const el = document.querySelector('#toast');
-  el.classList.remove('hidden', 'danger');
-  if (isError) el.classList.add('danger');
-  el.textContent = message;
-  window.setTimeout(() => {
-    el.classList.add('hidden');
-    el.classList.remove('danger');
-  }, 3000);
+function loadLocalData() {
+  const local = loadJson(STORAGE_KEY, { revision: null, expenses: [], incomes: [] });
+  state.data = {
+    revision: local.revision || null,
+    expenses: Array.isArray(local.expenses) ? local.expenses.map(normaliseExpense).filter((x) => x.amount > 0) : [],
+    incomes: Array.isArray(local.incomes) ? local.incomes.map(normaliseIncome).filter((x) => x.amount > 0) : [],
+  };
 }
 
-function setVisibleView(view) {
-  ['#gateView', '#appView'].forEach((id) => document.querySelector(id).classList.add('hidden'));
-  document.querySelector(view).classList.remove('hidden');
+function saveLocalData() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state.data));
 }
 
-function txStart(tx) {
-  return tx.startDate || tx.date;
+async function apiGetData() {
+  const res = await fetch(`${SYNC_API_BASE}/finance-data`, { credentials: 'include' });
+  if (!res.ok) throw new Error(`Sync read failed (${res.status})`);
+  return res.json();
 }
 
-function txEnd(tx) {
-  return tx.endDate || '';
-}
-
-function countOccurrencesInRange(tx, rangeStart, rangeEnd) {
-  const start = txStart(tx);
-  const end = txEnd(tx);
-  if (!dateInRange(rangeStart, start, end) && !dateInRange(rangeEnd, start, end) && rangeEnd < start) return 0;
-
-  if (tx.frequency === 'one-time') {
-    return tx.date >= rangeStart && tx.date <= rangeEnd ? 1 : 0;
+async function apiPutData(payload, revision) {
+  const res = await fetch(`${SYNC_API_BASE}/finance-data`, {
+    method: 'PUT',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(revision ? { 'If-Match': String(revision) } : {}),
+    },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 409) {
+    const latest = await res.json();
+    const err = new Error('Conflict: data changed by someone else. Reloaded latest version.');
+    err.latest = latest;
+    throw err;
   }
+  if (!res.ok) throw new Error(`Sync save failed (${res.status})`);
+  return res.json();
+}
 
-  if (tx.frequency === 'custom-months') {
-    const months = tx.customMonths.length ? tx.customMonths : [parseIsoDate(tx.date).getMonth() + 1];
-    let count = 0;
-    const startDate = parseIsoDate(rangeStart);
-    const endDate = parseIsoDate(rangeEnd);
-    for (let y = startDate.getFullYear(); y <= endDate.getFullYear(); y += 1) {
-      for (const m of months) {
-        const day = parseIsoDate(tx.date).getDate();
-        const maxDay = new Date(y, m, 0).getDate();
-        const occ = `${y}-${String(m).padStart(2, '0')}-${String(Math.min(day, maxDay)).padStart(2, '0')}`;
-        if (occ >= rangeStart && occ <= rangeEnd && dateInRange(occ, start, end)) count += 1;
-      }
+async function loadData() {
+  loadLocalData();
+  if (!SYNC_API_BASE) return;
+  try {
+    const remote = await apiGetData();
+    state.data = {
+      revision: remote.revision || null,
+      expenses: Array.isArray(remote.data?.expenses) ? remote.data.expenses.map(normaliseExpense) : [],
+      incomes: Array.isArray(remote.data?.incomes) ? remote.data.incomes.map(normaliseIncome) : [],
+    };
+    saveLocalData();
+    setSyncStatus('Synced');
+  } catch (err) {
+    setSyncStatus('Sync unavailable (using local cache)');
+    showToast(err.message, true);
+  }
+}
+
+async function saveData() {
+  saveLocalData();
+  if (!SYNC_API_BASE) return;
+  try {
+    const payload = { expenses: state.data.expenses, incomes: state.data.incomes };
+    const response = await apiPutData(payload, state.data.revision);
+    state.data.revision = response.revision || state.data.revision;
+    saveLocalData();
+    setSyncStatus('Synced');
+  } catch (err) {
+    if (err.latest) {
+      state.data = {
+        revision: err.latest.revision || null,
+        expenses: Array.isArray(err.latest.data?.expenses) ? err.latest.data.expenses.map(normaliseExpense) : [],
+        incomes: Array.isArray(err.latest.data?.incomes) ? err.latest.data.incomes.map(normaliseIncome) : [],
+      };
+      saveLocalData();
+      renderAll();
     }
-    return count;
+    setSyncStatus('Sync conflict/error');
+    throw err;
   }
+}
 
+function startPolling() {
+  if (!SYNC_API_BASE) return;
+  if (state.pollHandle) clearInterval(state.pollHandle);
+  state.pollHandle = setInterval(async () => {
+    try {
+      const remote = await apiGetData();
+      if (remote.revision && remote.revision !== state.data.revision) {
+        state.data = {
+          revision: remote.revision,
+          expenses: Array.isArray(remote.data?.expenses) ? remote.data.expenses.map(normaliseExpense) : [],
+          incomes: Array.isArray(remote.data?.incomes) ? remote.data.incomes.map(normaliseIncome) : [],
+        };
+        saveLocalData();
+        renderAll();
+        setSyncStatus('Synced (updated)');
+      }
+    } catch {
+      setSyncStatus('Sync unavailable');
+    }
+  }, 12000);
+}
+
+function occurrenceCount(entry, startIso, endIso) {
+  if (!entry.recurring) {
+    return inRange(entry.date, startIso, endIso) ? 1 : 0;
+  }
+  const step = entry.frequency;
   let count = 0;
-  let current = parseIsoDate(start);
-  const endRange = parseIsoDate(rangeEnd);
-  const startRange = parseIsoDate(rangeStart);
-  const step = tx.frequency === 'weekly' ? 'weekly' : tx.frequency === 'monthly' ? 'monthly' : tx.frequency === 'quarterly' ? 'quarterly' : 'yearly';
-  while (current <= endRange) {
+  let current = parseIsoDate(entry.date);
+  const end = parseIsoDate(endIso);
+  while (current <= end) {
     const iso = current.toISOString().slice(0, 10);
-    if (iso >= rangeStart && iso <= rangeEnd && dateInRange(iso, start, end)) count += 1;
+    if (inRange(iso, startIso, endIso)) count += 1;
     if (step === 'weekly') current = addDays(current, 7);
     if (step === 'monthly') current = addMonths(current, 1);
-    if (step === 'quarterly') current = addMonths(current, 3);
     if (step === 'yearly') current = addMonths(current, 12);
-    if (current < startRange && step !== 'weekly') break;
   }
   return count;
 }
 
-function actualAmountForMonth(tx, ym) {
-  const start = `${ym}-01`;
-  const end = endOfMonth(ym);
-  return tx.amount * countOccurrencesInRange(tx, start, end);
-}
-
-function actualAmountForYear(tx, year) {
-  return tx.amount * countOccurrencesInRange(tx, `${year}-01-01`, `${year}-12-31`);
-}
-
-function normalisedMonthlyAmount(tx) {
-  if (tx.frequency === 'weekly') return (tx.amount * 52) / 12;
-  if (tx.frequency === 'monthly') return tx.amount;
-  if (tx.frequency === 'quarterly') return tx.amount / 3;
-  if (tx.frequency === 'yearly') return tx.amount / 12;
-  if (tx.frequency === 'custom-months') {
-    const months = tx.customMonths.length ? tx.customMonths.length : 1;
-    return (tx.amount * months) / 12;
+function amountForPeriod(entry, startIso, endIso) {
+  if (entry.incomeType === 'temporary' && entry.recurring) {
+    const now = todayIso();
+    if (startIso > now) return 0;
+    const cappedEnd = endIso > now ? now : endIso;
+    return entry.amount * occurrenceCount(entry, startIso, cappedEnd);
   }
-  return 0;
+  return entry.amount * occurrenceCount(entry, startIso, endIso);
 }
 
-function groupName(id) {
-  return state.data.groups.find((g) => g.id === id)?.name || 'Unknown group';
-}
+function computeMetrics() {
+  const { start, end } = startAndEndForView();
+  let totalIncome = 0;
+  let grossExpense = 0;
+  let linkedIncome = 0;
+  let mandatory = 0;
+  let avoidable = 0;
 
-function uniqueMonthsFromActuals() {
-  const set = new Set();
-  const today = todayIso();
-  set.add(monthKey(today));
-  state.data.transactions.forEach((tx) => {
-    const start = txStart(tx) || tx.date;
-    const end = txEnd(tx) || today;
-    set.add(monthKey(start));
-    set.add(monthKey(end));
+  const expenseCategoryTotals = new Map();
+  state.data.expenses.forEach((e) => {
+    const amount = amountForPeriod(e, start, end);
+    grossExpense += amount;
+    expenseCategoryTotals.set(e.category.toLowerCase(), (expenseCategoryTotals.get(e.category.toLowerCase()) || 0) + amount);
+    if (e.expenseType === 'mandatory') mandatory += amount;
+    if (e.expenseType === 'avoidable') avoidable += amount;
   });
-  return Array.from(set).sort();
-}
 
-function computeMonthlySeries(months = 12) {
-  const now = new Date(`${todayIso()}T00:00:00`);
-  const keys = [];
-  for (let i = months - 1; i >= 0; i -= 1) {
-    const d = addMonths(now, -i);
-    keys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
-  }
-  return keys.map((ym) => {
-    let income = 0;
-    let expense = 0;
-    state.data.transactions.forEach((tx) => {
-      const value = actualAmountForMonth(tx, ym);
-      if (tx.type === 'income') income += value;
-      else expense += value;
-    });
-    return { ym, income, expense, net: income - expense };
-  });
-}
-
-function filteredTransactions() {
-  const q = state.filters.q.trim().toLowerCase();
-  return state.data.transactions.filter((t) => {
-    const byQ = !q || t.description.toLowerCase().includes(q) || t.category.toLowerCase().includes(q) || groupName(t.groupId).toLowerCase().includes(q);
-    const byType = !state.filters.type || t.type === state.filters.type;
-    const byGroup = !state.filters.groupId || t.groupId === state.filters.groupId;
-    const byMonth = !state.filters.month || actualAmountForMonth(t, state.filters.month) > 0;
-    return byQ && byType && byGroup && byMonth;
-  });
-}
-
-function renderBars(containerId, rows) {
-  const root = document.querySelector(containerId);
-  if (!rows.length) {
-    root.innerHTML = '<p class="muted">No data yet.</p>';
-    return;
-  }
-  const max = Math.max(...rows.map((x) => x.value), 1);
-  root.innerHTML = rows
-    .map((row) => {
-      const width = Math.round((row.value / max) * 100);
-      return `<div class="bar-row"><div class="bar-label"><span>${escapeHtml(row.label)}</span><strong>${formatCurrency(row.value)}</strong></div><div class="bar-track"><span style="width:${width}%"></span></div></div>`;
-    })
-    .join('');
-}
-
-function computeDashboardMetrics() {
-  const today = todayIso();
-  const ym = monthKey(today);
-  const year = Number(ym.slice(0, 4));
-
-  let actualMonthlyIncome = 0;
-  let actualMonthlyExpense = 0;
-  let actualYearlyIncome = 0;
-  let actualYearlyExpense = 0;
-  let normalisedIncome = 0;
-  let normalisedExpense = 0;
-  let normalisedMandatory = 0;
-  let normalisedOptional = 0;
-  let normalisedReducible = 0;
-
-  const groups = new Map(state.data.groups.map((g) => [g.id, { id: g.id, name: g.name, monthIncome: 0, monthExpense: 0, yearIncome: 0, yearExpense: 0 }]));
-
-  state.data.transactions.forEach((tx) => {
-    const monthValue = actualAmountForMonth(tx, ym);
-    const yearValue = actualAmountForYear(tx, year);
-    const norm = normalisedMonthlyAmount(tx);
-    const group = groups.get(tx.groupId);
-
-    if (tx.type === 'income') {
-      actualMonthlyIncome += monthValue;
-      actualYearlyIncome += yearValue;
-      normalisedIncome += norm;
-      if (group) {
-        group.monthIncome += monthValue;
-        group.yearIncome += yearValue;
-      }
-    } else {
-      actualMonthlyExpense += monthValue;
-      actualYearlyExpense += yearValue;
-      normalisedExpense += norm;
-      if (tx.classification === 'mandatory') normalisedMandatory += norm;
-      if (tx.classification === 'optional') normalisedOptional += norm;
-      if (tx.classification === 'reducible') normalisedReducible += norm;
-      if (group) {
-        group.monthExpense += monthValue;
-        group.yearExpense += yearValue;
-      }
+  state.data.incomes.forEach((i) => {
+    const amount = amountForPeriod(i, start, end);
+    totalIncome += amount;
+    if (i.relatesToExpense && expenseCategoryTotals.has(i.relatesToExpense.toLowerCase())) {
+      linkedIncome += amount;
     }
   });
 
-  const series = computeMonthlySeries(12);
-  const avgMonthlyCost = series.length ? series.reduce((s, x) => s + x.expense, 0) / series.length : 0;
-  const annualCommitments = normalisedExpense * 12;
-
-  return {
-    ym,
-    year,
-    actualMonthlyIncome,
-    actualMonthlyExpense,
-    actualMonthlyNet: actualMonthlyIncome - actualMonthlyExpense,
-    actualYearlyIncome,
-    actualYearlyExpense,
-    actualYearlyNet: actualYearlyIncome - actualYearlyExpense,
-    normalisedIncome,
-    normalisedExpense,
-    normalisedNet: normalisedIncome - normalisedExpense,
-    normalisedMandatory,
-    normalisedReducible,
-    normalisedOptional,
-    avgMonthlyCost,
-    annualCommitments,
-    groupRows: Array.from(groups.values()),
-    series,
-  };
+  const netExpenseAfterLinkedIncome = grossExpense - linkedIncome;
+  const remainingHouseholdIncome = totalIncome - grossExpense;
+  return { totalIncome, grossExpense, linkedIncome, netExpenseAfterLinkedIncome, remainingHouseholdIncome, mandatory, avoidable };
 }
 
-function renderDashboardTab() {
-  const m = computeDashboardMetrics();
-  document.querySelector('#dashActualIncome').textContent = formatCurrency(m.actualMonthlyIncome);
-  document.querySelector('#dashActualExpense').textContent = formatCurrency(m.actualMonthlyExpense);
-  document.querySelector('#dashActualNet').textContent = formatCurrency(m.actualMonthlyNet);
-  document.querySelector('#dashNormIncome').textContent = formatCurrency(m.normalisedIncome);
-  document.querySelector('#dashNormExpense').textContent = formatCurrency(m.normalisedExpense);
-  document.querySelector('#dashNormNet').textContent = formatCurrency(m.normalisedNet);
-  document.querySelector('#dashMandatory').textContent = formatCurrency(m.normalisedMandatory);
-  document.querySelector('#dashOptional').textContent = formatCurrency(m.normalisedOptional);
-  document.querySelector('#dashAvgCost').textContent = formatCurrency(m.avgMonthlyCost);
-  document.querySelector('#dashAnnualCommit').textContent = formatCurrency(m.annualCommitments);
-  document.querySelector('#dashYearIncome').textContent = formatCurrency(m.actualYearlyIncome);
-  document.querySelector('#dashYearExpense').textContent = formatCurrency(m.actualYearlyExpense);
-
-  const budgetFill = document.querySelector('#budgetFill');
-  const budgetStatus = document.querySelector('#budgetStatus');
-  document.querySelector('#budgetAmount').value = Number(state.data.monthlyBudget || 0).toFixed(2);
-  if (state.data.monthlyBudget > 0) {
-    const ratio = (m.actualMonthlyExpense / state.data.monthlyBudget) * 100;
-    budgetFill.style.width = `${Math.min(Math.round(ratio), 100)}%`;
-    budgetFill.className = ratio >= 100 ? 'danger-fill' : ratio >= 80 ? 'warn-fill' : '';
-    budgetStatus.textContent =
-      ratio >= 100
-        ? `Over budget by ${formatCurrency(m.actualMonthlyExpense - state.data.monthlyBudget)}`
-        : `Remaining budget: ${formatCurrency(state.data.monthlyBudget - m.actualMonthlyExpense)}`;
-  } else {
-    budgetFill.style.width = '0%';
-    budgetFill.className = '';
-    budgetStatus.textContent = 'Set a monthly budget if you want overspend alerts.';
-  }
-
-  const categorySums = new Map();
-  const groupSums = new Map();
-  state.data.transactions.forEach((tx) => {
-    if (tx.type !== 'expense') return;
-    const value = actualAmountForMonth(tx, m.ym);
-    categorySums.set(tx.category, (categorySums.get(tx.category) || 0) + value);
-    groupSums.set(groupName(tx.groupId), (groupSums.get(groupName(tx.groupId)) || 0) + value);
-  });
-  renderBars('#dashCategoryBars', Array.from(categorySums.entries()).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value));
-  renderBars('#dashGroupBars', Array.from(groupSums.entries()).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value));
-
-  renderBars(
-    '#dashTrendBars',
-    m.series.map((x) => ({ label: x.ym, value: x.expense })),
-  );
-
-  const groupBody = document.querySelector('#groupPerfBody');
-  groupBody.innerHTML = m.groupRows
-    .map((g) => {
-      const monthNet = g.monthIncome - g.monthExpense;
-      const yearNet = g.yearIncome - g.yearExpense;
-      return `<tr>
-        <td>${escapeHtml(g.name)}</td>
-        <td>${formatCurrency(g.monthIncome)}</td>
-        <td>${formatCurrency(g.monthExpense)}</td>
-        <td>${formatCurrency(monthNet)}</td>
-        <td>${formatCurrency(g.yearIncome)}</td>
-        <td>${formatCurrency(g.yearExpense)}</td>
-        <td>${formatCurrency(yearNet)}</td>
-      </tr>`;
-    })
-    .join('');
+function renderDashboard() {
+  const m = computeMetrics();
+  document.querySelector('#metricIncome').textContent = formatCurrency(m.totalIncome);
+  document.querySelector('#metricGrossExpense').textContent = formatCurrency(m.grossExpense);
+  document.querySelector('#metricLinkedIncome').textContent = formatCurrency(m.linkedIncome);
+  document.querySelector('#metricNetExpense').textContent = formatCurrency(m.netExpenseAfterLinkedIncome);
+  document.querySelector('#metricRemaining').textContent = formatCurrency(m.remainingHouseholdIncome);
+  document.querySelector('#metricMandatory').textContent = formatCurrency(m.mandatory);
+  document.querySelector('#metricAvoidable').textContent = formatCurrency(m.avoidable);
 }
 
-function renderTransactionsTab() {
-  const categoryOptions = state.data.categories.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
-  const groupOptions = state.data.groups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join('');
-  document.querySelector('#txCategory').innerHTML = categoryOptions;
-  document.querySelector('#txGroup').innerHTML = groupOptions;
-  document.querySelector('#filterGroup').innerHTML = `<option value="">All groups</option>${groupOptions}`;
-  document.querySelector('#filterMonth').innerHTML = `<option value="">All months</option>${uniqueMonthsFromActuals().map((x) => `<option value="${x}">${x}</option>`).join('')}`;
-  document.querySelector('#filterType').value = state.filters.type;
-  document.querySelector('#filterGroup').value = state.filters.groupId;
-  document.querySelector('#filterMonth').value = state.filters.month;
-  document.querySelector('#filterQ').value = state.filters.q;
-  if (!state.editingId) {
-    document.querySelector('#txGroup').value = 'general-household';
-  }
-
-  const body = document.querySelector('#txTableBody');
-  const rows = filteredTransactions();
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="11" class="muted">No transactions.</td></tr>';
-    return;
-  }
-  body.innerHTML = rows
+function renderTables() {
+  const expenseBody = document.querySelector('#expenseTableBody');
+  const incomeBody = document.querySelector('#incomeTableBody');
+  expenseBody.innerHTML = state.data.expenses
     .sort((a, b) => `${b.date}-${b.createdAt}`.localeCompare(`${a.date}-${a.createdAt}`))
-    .map((tx) => {
-      const amountLabel = tx.type === 'income' ? formatCurrency(tx.amount) : `-${formatCurrency(tx.amount)}`;
-      return `<tr>
-        <td>${escapeHtml(tx.type)}</td>
-        <td>${amountLabel}</td>
-        <td>${escapeHtml(tx.category)}</td>
-        <td>${escapeHtml(groupName(tx.groupId))}</td>
-        <td>${formatDate(tx.date)}</td>
-        <td>${escapeHtml(tx.frequency)}</td>
-        <td>${escapeHtml(tx.startDate || '-')}</td>
-        <td>${escapeHtml(tx.endDate || '-')}</td>
-        <td>${escapeHtml(tx.classification || '-')}</td>
-        <td>${escapeHtml(tx.description || '-')}</td>
-        <td><div class="table-actions"><button class="small secondary" data-action="edit" data-id="${tx.id}" type="button">Edit</button><button class="small danger" data-action="delete" data-id="${tx.id}" type="button">Delete</button></div></td>
-      </tr>`;
-    })
+    .map(
+      (e) => `<tr>
+      <td>${formatDate(e.date)}</td>
+      <td>${formatCurrency(e.amount)}</td>
+      <td>${escapeHtml(e.frequency)}</td>
+      <td>${escapeHtml(e.category)}</td>
+      <td>${escapeHtml(e.expenseType)}</td>
+      <td>${escapeHtml(e.recurring ? 'Yes' : 'No')}</td>
+      <td>${escapeHtml(e.note || '-')}</td>
+      <td><div class="table-actions"><button type="button" class="small secondary" data-action="edit-expense" data-id="${e.id}">Edit</button><button type="button" class="small danger" data-action="delete-expense" data-id="${e.id}">Delete</button></div></td>
+    </tr>`,
+    )
     .join('');
-}
+  if (!expenseBody.innerHTML) expenseBody.innerHTML = '<tr><td colspan="8" class="muted">No expenses yet.</td></tr>';
 
-function renderGroupsTab() {
-  const rows = state.data.groups
-    .map((g) => {
-      const tx = state.data.transactions.filter((x) => x.groupId === g.id);
-      return `<tr>
-        <td>${escapeHtml(g.name)}</td>
-        <td>${tx.filter((x) => x.type === 'income').length}</td>
-        <td>${tx.filter((x) => x.type === 'expense').length}</td>
-        <td>${tx.length}</td>
-        <td><div class="table-actions"><button class="small secondary" data-action="rename-group" data-id="${g.id}" type="button">Rename</button><button class="small danger" data-action="delete-group" data-id="${g.id}" type="button">Delete</button></div></td>
-      </tr>`;
-    })
+  incomeBody.innerHTML = state.data.incomes
+    .sort((a, b) => `${b.date}-${b.createdAt}`.localeCompare(`${a.date}-${a.createdAt}`))
+    .map(
+      (i) => `<tr>
+      <td>${formatDate(i.date)}</td>
+      <td>${formatCurrency(i.amount)}</td>
+      <td>${escapeHtml(i.frequency)}</td>
+      <td>${escapeHtml(i.category)}</td>
+      <td>${escapeHtml(i.relatesToExpense || '-')}</td>
+      <td>${escapeHtml(i.incomeType)}</td>
+      <td>${escapeHtml(i.recurring ? 'Yes' : 'No')}</td>
+      <td>${escapeHtml(i.note || '-')}</td>
+      <td><div class="table-actions"><button type="button" class="small secondary" data-action="edit-income" data-id="${i.id}">Edit</button><button type="button" class="small danger" data-action="delete-income" data-id="${i.id}">Delete</button></div></td>
+    </tr>`,
+    )
     .join('');
-  document.querySelector('#groupsTableBody').innerHTML = rows || '<tr><td colspan="5" class="muted">No groups.</td></tr>';
-
-  const catRows = state.data.categories
-    .map((c) => `<tr><td>${escapeHtml(c)}</td><td><button class="small danger" data-action="delete-category" data-name="${escapeHtml(c)}" type="button">Delete</button></td></tr>`)
-    .join('');
-  document.querySelector('#categoriesTableBody').innerHTML = catRows || '<tr><td colspan="2" class="muted">No categories.</td></tr>';
+  if (!incomeBody.innerHTML) incomeBody.innerHTML = '<tr><td colspan="9" class="muted">No income yet.</td></tr>';
 }
 
-function scenarioMonthlyIncome(tx) {
-  const removed = state.scenario.removedIncomeIds.includes(tx.id);
-  if (removed) return 0;
-  const override = state.scenario.incomeOverrides[tx.id];
-  if (override !== undefined && Number.isFinite(Number(override)) && Number(override) >= 0) return Number(override);
-  return normalisedMonthlyAmount(tx);
+function renderTabs() {
+  document.querySelectorAll('[data-tab-panel]').forEach((x) => x.classList.add('hidden'));
+  document.querySelectorAll('.tab-btn').forEach((x) => x.classList.toggle('active', x.dataset.tab === state.activeTab));
+  document.querySelector(`#tab-${state.activeTab}`).classList.remove('hidden');
 }
 
-function renderWhatIfTab() {
-  const incomeTx = state.data.transactions.filter((x) => x.type === 'income');
-  const expTx = state.data.transactions.filter((x) => x.type === 'expense');
-  const monthlyIncome = incomeTx.reduce((s, tx) => s + scenarioMonthlyIncome(tx), 0);
-  const mandatory = expTx.filter((x) => x.classification === 'mandatory').reduce((s, tx) => s + normalisedMonthlyAmount(tx), 0);
-  const reducible = expTx.filter((x) => x.classification === 'reducible').reduce((s, tx) => s + normalisedMonthlyAmount(tx), 0);
-  const optionalRaw = expTx.filter((x) => x.classification === 'optional').reduce((s, tx) => s + normalisedMonthlyAmount(tx), 0);
-  const optionalAfter = optionalRaw * (1 - state.scenario.optionalReductionPct / 100);
-  const monthlyExpense = mandatory + reducible + optionalAfter;
-  const monthlyNet = monthlyIncome - monthlyExpense;
-  const annualNet = monthlyNet * 12;
-
-  document.querySelector('#whatIfIncome').textContent = formatCurrency(monthlyIncome);
-  document.querySelector('#whatIfMandatory').textContent = formatCurrency(mandatory);
-  document.querySelector('#whatIfOptional').textContent = formatCurrency(optionalAfter);
-  document.querySelector('#whatIfExpense').textContent = formatCurrency(monthlyExpense);
-  document.querySelector('#whatIfNetMonth').textContent = formatCurrency(monthlyNet);
-  document.querySelector('#whatIfNetYear').textContent = formatCurrency(annualNet);
-  document.querySelector('#optionalReductionLabel').textContent = `${state.scenario.optionalReductionPct}%`;
-  document.querySelector('#optionalReduction').value = String(state.scenario.optionalReductionPct);
-
-  const body = document.querySelector('#whatIfIncomeBody');
-  body.innerHTML = incomeTx
-    .map((tx) => {
-      const checked = state.scenario.removedIncomeIds.includes(tx.id) ? '' : 'checked';
-      const override = state.scenario.incomeOverrides[tx.id];
-      const base = normalisedMonthlyAmount(tx);
-      return `<tr>
-        <td><input type="checkbox" data-action="toggle-income" data-id="${tx.id}" ${checked} /></td>
-        <td>${escapeHtml(tx.description || tx.category)}</td>
-        <td>${escapeHtml(groupName(tx.groupId))}</td>
-        <td>${formatCurrency(base)}</td>
-        <td><input type="number" min="0" step="0.01" data-action="override-income" data-id="${tx.id}" value="${override !== undefined ? Number(override).toFixed(2) : ''}" placeholder="Use base" /></td>
-      </tr>`;
-    })
-    .join('');
+function renderAll() {
+  document.querySelector('#signedInName').textContent = state.user;
+  document.querySelector('#syncStatus').textContent = state.syncStatus;
+  document.querySelector('#viewMode').value = state.view.mode;
+  document.querySelector('#viewMonth').value = state.view.month;
+  document.querySelector('#viewYear').value = state.view.year;
+  document.querySelector('#viewMonthWrap').classList.toggle('hidden', state.view.mode !== 'monthly');
+  document.querySelector('#viewYearWrap').classList.toggle('hidden', state.view.mode !== 'yearly');
+  renderTabs();
+  renderDashboard();
+  renderTables();
 }
 
-function renderActiveTab() {
-  document.querySelectorAll('[data-tab]').forEach((el) => el.classList.add('hidden'));
-  document.querySelectorAll('.tab-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.tabTarget === state.tab));
-  document.querySelector(`#tab-${state.tab}`).classList.remove('hidden');
-  if (state.tab === 'dashboard') renderDashboardTab();
-  if (state.tab === 'transactions') renderTransactionsTab();
-  if (state.tab === 'groups') renderGroupsTab();
-  if (state.tab === 'whatif') renderWhatIfTab();
-}
-
-function renderShell() {
-  const monthChecks = MONTH_NAMES.map((m, i) => `<label class="month-item"><input type="checkbox" name="customMonths" value="${i + 1}" /> ${m}</label>`).join('');
-  document.querySelector('#app').innerHTML = `
-    <main class="container">
-      <section id="toast" class="card hidden"></section>
-
-      <section id="gateView" class="card">
-        <h1>Household Finance Tracker</h1>
-        <p class="muted">Public GitHub-hosted app with a playful entry screen (not security/authentication).</p>
-        <form id="unlockForm" class="stack">
-          <label>Name <input name="name" required maxlength="60" /></label>
-          <label>Date of birth <input name="dob" type="date" required /></label>
-          <p class="muted">For this setup, DOB must be today’s date.</p>
-          <button type="submit">Enter</button>
-        </form>
-      </section>
-
-      <section id="appView" class="hidden">
-        <div class="card topbar">
-          <div>
-            <h2>Household Finance</h2>
-            <p class="muted">Opened by <strong id="signedInName"></strong></p>
-          </div>
-          <button id="lockButton" class="secondary">Lock</button>
-        </div>
-
-        <section class="card tabs">
-          <button class="tab-btn active" data-tab-target="dashboard" type="button">Dashboard</button>
-          <button class="tab-btn" data-tab-target="transactions" type="button">Transactions</button>
-          <button class="tab-btn" data-tab-target="groups" type="button">Financial Groups</button>
-          <button class="tab-btn" data-tab-target="whatif" type="button">What If?</button>
-        </section>
-
-        <section class="card" id="tab-dashboard" data-tab>
-          <h3>Actual cash flow (this month)</h3>
-          <div class="grid cards3">
-            <article class="card stat"><p class="muted">Income</p><h3 id="dashActualIncome">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Expenses</p><h3 id="dashActualExpense">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Net cash flow</p><h3 id="dashActualNet">€0.00</h3></article>
-          </div>
-          <h3 class="section-title">Normalised monthly view</h3>
-          <div class="grid cards3">
-            <article class="card stat"><p class="muted">Normalised income</p><h3 id="dashNormIncome">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Normalised expenses</p><h3 id="dashNormExpense">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Normalised net</p><h3 id="dashNormNet">€0.00</h3></article>
-          </div>
-          <div class="grid cards4">
-            <article class="card stat"><p class="muted">Mandatory expenses</p><h3 id="dashMandatory">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Optional expenses</p><h3 id="dashOptional">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Avg monthly costs</p><h3 id="dashAvgCost">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Estimated annual commitments</p><h3 id="dashAnnualCommit">€0.00</h3></article>
-          </div>
-          <div class="grid cards2">
-            <article class="card stat"><p class="muted">Actual yearly income</p><h3 id="dashYearIncome">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Actual yearly expenses</p><h3 id="dashYearExpense">€0.00</h3></article>
-          </div>
-          <h3 class="section-title">Budget</h3>
-          <form id="budgetForm" class="inline-form">
-            <label>Monthly budget (EUR)<input id="budgetAmount" name="budget" type="number" min="0" step="0.01" required /></label>
-            <button type="submit">Save budget</button>
-          </form>
-          <div class="progress"><span id="budgetFill"></span></div>
-          <p class="muted" id="budgetStatus"></p>
-
-          <div class="grid cards3">
-            <section class="card"><h3>Expense by category (month)</h3><div id="dashCategoryBars" class="bars"></div></section>
-            <section class="card"><h3>Expense by group (month)</h3><div id="dashGroupBars" class="bars"></div></section>
-            <section class="card"><h3>Income vs expense trend</h3><div id="dashTrendBars" class="bars"></div></section>
-          </div>
-
-          <section class="card">
-            <h3>Financial group performance (actual)</h3>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Group</th><th>Month income</th><th>Month expense</th><th>Month net</th><th>Year income</th><th>Year expense</th><th>Year net</th></tr></thead>
-                <tbody id="groupPerfBody"></tbody>
-              </table>
-            </div>
-          </section>
-        </section>
-
-        <section class="card hidden" id="tab-transactions" data-tab>
-          <h3>Add Income / Add Expense</h3>
-          <div class="toolbar">
-            <button id="quickAddIncomeButton" type="button">Add Income</button>
-            <button id="quickAddExpenseButton" class="secondary" type="button">Add Expense</button>
-          </div>
-          <form id="txForm" class="grid-form">
-            <label>Type
-              <select name="type" id="txType">
-                <option value="income">Income</option>
-                <option value="expense">Expense</option>
-              </select>
-            </label>
-            <label>Amount (EUR)<input name="amount" type="number" step="0.01" min="0.01" required /></label>
-            <label>Date<input name="date" type="date" required /></label>
-            <label>Frequency
-              <select name="frequency" id="txFrequency">${FREQUENCIES.map((f) => `<option value="${f}">${f}</option>`).join('')}</select>
-            </label>
-            <label>Start date<input name="startDate" type="date" /></label>
-            <label>End date<input name="endDate" type="date" /></label>
-            <label>Category
-              <select name="category" id="txCategory"></select>
-            </label>
-            <label>Financial group
-              <select name="groupId" id="txGroup"></select>
-            </label>
-            <label id="classificationWrap">Expense class
-              <select name="classification" id="txClassification">${EXPENSE_CLASSES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select>
-            </label>
-            <label class="wide">Description (optional)<textarea name="description" maxlength="300"></textarea></label>
-            <fieldset id="customMonthsWrap" class="wide hidden">
-              <legend>Months (for custom-months)</legend>
-              <div class="month-grid">${monthChecks}</div>
-            </fieldset>
-            <div class="actions">
-              <button type="submit" id="saveTxButton">Save transaction</button>
-              <button type="button" id="cancelTxEditButton" class="secondary hidden">Cancel edit</button>
-            </div>
-          </form>
-
-          <div class="split">
-            <form id="addCategoryForm" class="stack">
-              <h3>Add category</h3>
-              <label>Category name<input name="name" maxlength="60" required /></label>
-              <button type="submit">Add category</button>
-            </form>
-            <form id="addGroupQuickForm" class="stack">
-              <h3>Add financial group</h3>
-              <label>Group name<input name="name" maxlength="80" required /></label>
-              <button type="submit">Add group</button>
-            </form>
-          </div>
-
-          <section class="card">
-            <h3>Search & filter</h3>
-            <form id="txFilterForm" class="filters">
-              <label>Search<input id="filterQ" name="q" placeholder="category, description, group..." /></label>
-              <label>Type<select id="filterType" name="type"><option value="">All</option><option value="income">Income</option><option value="expense">Expense</option></select></label>
-              <label>Group<select id="filterGroup" name="groupId"></select></label>
-              <label>Month<select id="filterMonth" name="month"></select></label>
-              <button type="button" id="clearTxFilters" class="secondary">Clear</button>
-            </form>
-          </section>
-
-          <section class="card">
-            <div class="section-head">
-              <h3>Transactions</h3>
-              <div class="toolbar">
-                <button id="exportCsvButton" class="secondary" type="button">Export CSV</button>
-                <button id="exportExcelButton" class="secondary" type="button">Export Excel</button>
-                <button id="backupButton" class="secondary" type="button">Backup JSON</button>
-                <label class="file-label secondary">Restore JSON<input id="restoreInput" type="file" accept=".json,application/json" /></label>
-              </div>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Type</th><th>Amount</th><th>Category</th><th>Group</th><th>Date</th><th>Frequency</th><th>Start</th><th>End</th><th>Class</th><th>Description</th><th>Actions</th></tr></thead>
-                <tbody id="txTableBody"></tbody>
-              </table>
-            </div>
-          </section>
-        </section>
-
-        <section class="card hidden" id="tab-groups" data-tab>
-          <div class="split">
-            <form id="addGroupForm" class="stack">
-              <h3>Add financial group</h3>
-              <label>Group name<input name="name" required maxlength="80" /></label>
-              <button type="submit">Add group</button>
-            </form>
-            <form id="addCategoryForm2" class="stack">
-              <h3>Add category</h3>
-              <label>Category name<input name="name" required maxlength="60" /></label>
-              <button type="submit">Add category</button>
-            </form>
-          </div>
-          <section class="card">
-            <h3>Financial groups</h3>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Name</th><th>Income streams</th><th>Expense streams</th><th>Total streams</th><th>Actions</th></tr></thead>
-                <tbody id="groupsTableBody"></tbody>
-              </table>
-            </div>
-          </section>
-          <section class="card">
-            <h3>Categories</h3>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Name</th><th>Actions</th></tr></thead>
-                <tbody id="categoriesTableBody"></tbody>
-              </table>
-            </div>
-          </section>
-        </section>
-
-        <section class="card hidden" id="tab-whatif" data-tab>
-          <h3>Scenario planner (does not change saved records)</h3>
-          <label>Reduce optional expenses %
-            <input id="optionalReduction" type="range" min="0" max="100" step="5" value="0" />
-          </label>
-          <p class="muted">Optional reduction: <strong id="optionalReductionLabel">0%</strong></p>
-
-          <div class="grid cards3">
-            <article class="card stat"><p class="muted">Scenario monthly income</p><h3 id="whatIfIncome">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Mandatory monthly expenses</p><h3 id="whatIfMandatory">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Optional monthly expenses (after reduction)</p><h3 id="whatIfOptional">€0.00</h3></article>
-          </div>
-          <div class="grid cards3">
-            <article class="card stat"><p class="muted">Scenario monthly expenses</p><h3 id="whatIfExpense">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Monthly surplus / shortfall</p><h3 id="whatIfNetMonth">€0.00</h3></article>
-            <article class="card stat"><p class="muted">Annual surplus / shortfall</p><h3 id="whatIfNetYear">€0.00</h3></article>
-          </div>
-
-          <section class="card">
-            <h3>Adjust income streams</h3>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Use</th><th>Income stream</th><th>Group</th><th>Base normalised/month</th><th>Override/month (optional)</th></tr></thead>
-                <tbody id="whatIfIncomeBody"></tbody>
-              </table>
-            </div>
-          </section>
-        </section>
-      </section>
-    </main>
-  `;
-}
-
-function resetTxForm() {
-  state.editingId = null;
-  const form = document.querySelector('#txForm');
+function resetExpenseForm() {
+  state.editingExpenseId = null;
+  const form = document.querySelector('#expenseForm');
   form.reset();
-  form.date.value = todayIso();
-  form.frequency.value = 'one-time';
-  form.type.value = 'expense';
-  form.groupId.value = 'general-household';
-  form.classification.value = 'reducible';
-  updateTxFormVisibility();
-  document.querySelectorAll('#customMonthsWrap input[type="checkbox"]').forEach((cb) => {
-    cb.checked = false;
-  });
-  document.querySelector('#saveTxButton').textContent = 'Save transaction';
-  document.querySelector('#cancelTxEditButton').classList.add('hidden');
+  form.expenseDate.value = todayIso();
+  form.expenseFrequency.value = 'monthly';
+  form.expenseType.value = 'mandatory';
+  form.expenseRecurring.value = 'yes';
+  document.querySelector('#saveExpenseButton').textContent = 'Save expense';
+  document.querySelector('#cancelExpenseEditButton').classList.add('hidden');
 }
 
-function updateTxFormVisibility() {
-  const form = document.querySelector('#txForm');
-  const isExpense = form.type.value === 'expense';
-  const isCustom = form.frequency.value === 'custom-months';
-  document.querySelector('#classificationWrap').classList.toggle('hidden', !isExpense);
-  document.querySelector('#customMonthsWrap').classList.toggle('hidden', !isCustom);
+function resetIncomeForm() {
+  state.editingIncomeId = null;
+  const form = document.querySelector('#incomeForm');
+  form.reset();
+  form.incomeDate.value = todayIso();
+  form.incomeFrequency.value = 'monthly';
+  form.incomeType.value = 'permanent';
+  form.incomeRecurring.value = 'yes';
+  document.querySelector('#saveIncomeButton').textContent = 'Save income';
+  document.querySelector('#cancelIncomeEditButton').classList.add('hidden');
 }
 
-function toSlug(text) {
-  return text
-    .toLowerCase()
-    .trim()
-    .replaceAll(/[^a-z0-9]+/g, '-')
-    .replaceAll(/^-+|-+$/g, '');
-}
-
-function addCategory(name) {
-  const cleaned = String(name || '').trim();
-  if (!cleaned) throw new Error('Enter a category name.');
-  if (state.data.categories.some((c) => c.toLowerCase() === cleaned.toLowerCase())) throw new Error('Category already exists.');
-  state.data.categories.push(cleaned);
-  state.data.categories.sort((a, b) => a.localeCompare(b));
-  saveData();
-}
-
-function addGroup(name) {
-  const cleaned = String(name || '').trim();
-  if (!cleaned) throw new Error('Enter a group name.');
-  if (state.data.groups.some((g) => g.name.toLowerCase() === cleaned.toLowerCase())) throw new Error('Group already exists.');
-  const id = toSlug(cleaned) || crypto.randomUUID();
-  state.data.groups.push({ id, name: cleaned });
-  saveData();
-}
-
-function handleTxSubmit(event) {
+async function handleSaveExpense(event) {
   event.preventDefault();
   const form = new FormData(event.target);
-  const tx = normaliseTransaction({
-    id: state.editingId || crypto.randomUUID(),
-    type: form.get('type'),
+  const entry = normaliseExpense({
+    id: state.editingExpenseId || crypto.randomUUID(),
     amount: Number(form.get('amount')),
-    category: form.get('category'),
-    groupId: String(form.get('groupId') || 'general-household'),
-    date: form.get('date'),
-    frequency: form.get('frequency'),
-    startDate: form.get('startDate'),
-    endDate: form.get('endDate'),
-    customMonths: form.getAll('customMonths').map(Number),
-    classification: form.get('classification'),
-    description: String(form.get('description') || '').trim(),
+    date: String(form.get('expenseDate')),
+    frequency: String(form.get('expenseFrequency')),
+    category: String(form.get('category')).trim() || 'Other',
+    expenseType: String(form.get('expenseType')),
+    recurring: String(form.get('recurring')) === 'yes',
+    note: String(form.get('note') || '').trim(),
     createdAt: Date.now(),
   });
-  if (!Number.isFinite(tx.amount) || tx.amount <= 0) throw new Error('Amount must be greater than zero.');
-  if (!tx.category) throw new Error('Select a category.');
-  if (!tx.groupId) tx.groupId = 'general-household';
-  if (tx.endDate && tx.startDate && tx.endDate < tx.startDate) throw new Error('End date must be after start date.');
-  if (tx.frequency === 'custom-months' && !tx.customMonths.length) throw new Error('Select at least one month for custom-months.');
-
-  if (state.editingId) {
-    state.data.transactions = state.data.transactions.map((x) => (x.id === state.editingId ? tx : x));
+  if (!Number.isFinite(entry.amount) || entry.amount <= 0) throw new Error('Enter a valid expense amount.');
+  if (state.editingExpenseId) {
+    state.data.expenses = state.data.expenses.map((x) => (x.id === state.editingExpenseId ? entry : x));
   } else {
-    state.data.transactions.unshift(tx);
+    state.data.expenses.unshift(entry);
   }
-  saveData();
-  resetTxForm();
-  renderActiveTab();
+  await saveData();
+  resetExpenseForm();
+  renderExpenseCategoryList();
+  renderAll();
 }
 
-function handleTxActions(event) {
-  const button = event.target.closest('button[data-action]');
-  if (!button) return;
-  const id = button.dataset.id;
-  if (button.dataset.action === 'delete') {
-    if (!window.confirm('Delete this transaction?')) return;
-    state.data.transactions = state.data.transactions.filter((x) => x.id !== id);
-    saveData();
-    renderActiveTab();
-    return;
-  }
-
-  const tx = state.data.transactions.find((x) => x.id === id);
-  if (!tx) return;
-  state.tab = 'transactions';
-  renderActiveTab();
-  state.editingId = tx.id;
-  const form = document.querySelector('#txForm');
-  form.type.value = tx.type;
-  form.amount.value = tx.amount.toFixed(2);
-  form.category.value = tx.category;
-  form.groupId.value = tx.groupId;
-  form.date.value = tx.date;
-  form.frequency.value = tx.frequency;
-  form.startDate.value = tx.startDate || '';
-  form.endDate.value = tx.endDate || '';
-  form.classification.value = tx.classification || 'reducible';
-  form.description.value = tx.description || '';
-  document.querySelectorAll('#customMonthsWrap input[type="checkbox"]').forEach((cb) => {
-    cb.checked = tx.customMonths.includes(Number(cb.value));
+async function handleSaveIncome(event) {
+  event.preventDefault();
+  const form = new FormData(event.target);
+  const entry = normaliseIncome({
+    id: state.editingIncomeId || crypto.randomUUID(),
+    amount: Number(form.get('amount')),
+    date: String(form.get('incomeDate')),
+    frequency: String(form.get('incomeFrequency')),
+    category: String(form.get('category')).trim() || 'Other',
+    relatesToExpense: String(form.get('relatesToExpense') || '').trim(),
+    incomeType: String(form.get('incomeType')),
+    recurring: String(form.get('recurring')) === 'yes',
+    note: String(form.get('note') || '').trim(),
+    createdAt: Date.now(),
   });
-  updateTxFormVisibility();
-  document.querySelector('#saveTxButton').textContent = 'Update transaction';
-  document.querySelector('#cancelTxEditButton').classList.remove('hidden');
+  if (!Number.isFinite(entry.amount) || entry.amount <= 0) throw new Error('Enter a valid income amount.');
+  if (state.editingIncomeId) {
+    state.data.incomes = state.data.incomes.map((x) => (x.id === state.editingIncomeId ? entry : x));
+  } else {
+    state.data.incomes.unshift(entry);
+  }
+  await saveData();
+  resetIncomeForm();
+  renderAll();
+}
+
+function editExpense(id) {
+  const row = state.data.expenses.find((x) => x.id === id);
+  if (!row) return;
+  state.activeTab = 'expense';
+  renderTabs();
+  state.editingExpenseId = id;
+  const form = document.querySelector('#expenseForm');
+  form.amount.value = row.amount.toFixed(2);
+  form.expenseDate.value = row.date;
+  form.expenseFrequency.value = row.frequency;
+  form.category.value = row.category;
+  form.expenseType.value = row.expenseType;
+  form.recurring.value = row.recurring ? 'yes' : 'no';
+  form.note.value = row.note || '';
+  document.querySelector('#saveExpenseButton').textContent = 'Update expense';
+  document.querySelector('#cancelExpenseEditButton').classList.remove('hidden');
+}
+
+function editIncome(id) {
+  const row = state.data.incomes.find((x) => x.id === id);
+  if (!row) return;
+  state.activeTab = 'income';
+  renderTabs();
+  state.editingIncomeId = id;
+  const form = document.querySelector('#incomeForm');
+  form.amount.value = row.amount.toFixed(2);
+  form.incomeDate.value = row.date;
+  form.incomeFrequency.value = row.frequency;
+  form.category.value = row.category;
+  form.relatesToExpense.value = row.relatesToExpense || '';
+  form.incomeType.value = row.incomeType;
+  form.recurring.value = row.recurring ? 'yes' : 'no';
+  form.note.value = row.note || '';
+  document.querySelector('#saveIncomeButton').textContent = 'Update income';
+  document.querySelector('#cancelIncomeEditButton').classList.remove('hidden');
+}
+
+async function deleteExpense(id) {
+  state.data.expenses = state.data.expenses.filter((x) => x.id !== id);
+  await saveData();
+  renderExpenseCategoryList();
+  renderAll();
+}
+
+async function deleteIncome(id) {
+  state.data.incomes = state.data.incomes.filter((x) => x.id !== id);
+  await saveData();
+  renderAll();
+}
+
+function exportJson() {
+  const payload = { exportedAt: new Date().toISOString(), data: state.data };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `household-finance-backup-${todayIso()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function exportCsv() {
-  const rows = state.data.transactions.map((tx) => ({
-    type: tx.type,
-    amount_eur: tx.amount.toFixed(2),
-    category: tx.category,
-    financial_group: groupName(tx.groupId),
-    date: tx.date,
-    frequency: tx.frequency,
-    start_date: tx.startDate || '',
-    end_date: tx.endDate || '',
-    custom_months: tx.customMonths.join('|'),
-    expense_classification: tx.type === 'expense' ? tx.classification : '',
-    description: tx.description || '',
-  }));
-  if (!rows.length) throw new Error('No transactions to export.');
+  const rows = [
+    ...state.data.expenses.map((x) => ({
+      kind: 'expense',
+      amount_eur: x.amount.toFixed(2),
+      date: x.date,
+      frequency: x.frequency,
+      category: x.category,
+      mandatory_or_avoidable: x.expenseType,
+      recurring: x.recurring ? 'yes' : 'no',
+      relates_to_expense: '',
+      permanent_or_temporary: '',
+      note: x.note || '',
+    })),
+    ...state.data.incomes.map((x) => ({
+      kind: 'income',
+      amount_eur: x.amount.toFixed(2),
+      date: x.date,
+      frequency: x.frequency,
+      category: x.category,
+      mandatory_or_avoidable: '',
+      recurring: x.recurring ? 'yes' : 'no',
+      relates_to_expense: x.relatesToExpense || '',
+      permanent_or_temporary: x.incomeType,
+      note: x.note || '',
+    })),
+  ];
+  if (!rows.length) throw new Error('No entries to export.');
   const headers = Object.keys(rows[0]);
   const csv = [headers.join(','), ...rows.map((r) => headers.map((h) => `"${String(r[h]).replaceAll('"', '""')}"`).join(','))].join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -940,187 +552,255 @@ function exportCsv() {
 }
 
 function exportExcel() {
-  const rows = state.data.transactions.map((tx) => ({
-    Type: tx.type,
-    Amount_EUR: Number(tx.amount.toFixed(2)),
-    Category: tx.category,
-    Financial_Group: groupName(tx.groupId),
-    Date: tx.date,
-    Frequency: tx.frequency,
-    Start_Date: tx.startDate || '',
-    End_Date: tx.endDate || '',
-    Custom_Months: tx.customMonths.join('|'),
-    Expense_Classification: tx.type === 'expense' ? tx.classification : '',
-    Description: tx.description || '',
-  }));
-  if (!rows.length) throw new Error('No transactions to export.');
+  const rows = [
+    ...state.data.expenses.map((x) => ({
+      Kind: 'Expense',
+      Amount_EUR: Number(x.amount.toFixed(2)),
+      Date: x.date,
+      Frequency: x.frequency,
+      Category: x.category,
+      Mandatory_or_Avoidable: x.expenseType,
+      Recurring: x.recurring ? 'Yes' : 'No',
+      Relates_to_Expense: '',
+      Permanent_or_Temporary: '',
+      Note: x.note || '',
+    })),
+    ...state.data.incomes.map((x) => ({
+      Kind: 'Income',
+      Amount_EUR: Number(x.amount.toFixed(2)),
+      Date: x.date,
+      Frequency: x.frequency,
+      Category: x.category,
+      Mandatory_or_Avoidable: '',
+      Recurring: x.recurring ? 'Yes' : 'No',
+      Relates_to_Expense: x.relatesToExpense || '',
+      Permanent_or_Temporary: x.incomeType,
+      Note: x.note || '',
+    })),
+  ];
+  if (!rows.length) throw new Error('No entries to export.');
   const wb = utils.book_new();
-  utils.book_append_sheet(wb, utils.json_to_sheet(rows), 'Transactions');
+  utils.book_append_sheet(wb, utils.json_to_sheet(rows), 'Entries');
   writeFileXLSX(wb, `household-finance-${todayIso()}.xlsx`);
-}
-
-function backupJson() {
-  const payload = { exportedAt: new Date().toISOString(), data: state.data };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `household-finance-backup-${todayIso()}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
 }
 
 async function restoreJson(file) {
   const payload = JSON.parse(await file.text());
-  if (!payload || !payload.data || !Array.isArray(payload.data.transactions)) throw new Error('Invalid backup file.');
-  state.data = migrateData(payload.data);
-  saveData();
-  resetTxForm();
-  renderActiveTab();
+  const expenses = Array.isArray(payload?.data?.expenses) ? payload.data.expenses.map(normaliseExpense) : null;
+  const incomes = Array.isArray(payload?.data?.incomes) ? payload.data.incomes.map(normaliseIncome) : null;
+  if (!expenses || !incomes) throw new Error('Invalid backup file.');
+  state.data.expenses = expenses;
+  state.data.incomes = incomes;
+  await saveData();
+  renderAll();
+}
+
+function renderShell() {
+  document.querySelector('#app').innerHTML = `
+    <main class="container">
+      <section id="toast" class="card hidden"></section>
+
+      <section id="gateView" class="card">
+        <h1>Household Finance Tracker</h1>
+        <p class="muted">Playful welcome screen (not security/authentication).</p>
+        <form id="unlockForm" class="stack">
+          <label>Name <input name="name" required maxlength="60" /></label>
+          <label>Date of birth <input name="dob" type="date" required /></label>
+          <p class="muted">Expected DOB value: today's date.</p>
+          <button type="submit">Enter</button>
+        </form>
+      </section>
+
+      <section id="appView" class="hidden">
+        <div class="card topbar">
+          <div>
+            <h2>Household Finance</h2>
+            <p class="muted">Opened by <strong id="signedInName"></strong> • <span id="syncStatus"></span></p>
+          </div>
+          <button id="lockButton" class="secondary" type="button">Lock</button>
+        </div>
+
+        <section class="card">
+          <div class="toolbar">
+            <label>View
+              <select id="viewMode">
+                <option value="monthly">Monthly</option>
+                <option value="yearly">Yearly</option>
+              </select>
+            </label>
+            <label id="viewMonthWrap">Month <input id="viewMonth" type="month" /></label>
+            <label id="viewYearWrap" class="hidden">Year <input id="viewYear" type="number" min="2000" max="2100" /></label>
+            <button id="reloadButton" class="secondary" type="button">Refresh shared data</button>
+          </div>
+          <div class="grid cards3">
+            <article class="card stat"><p class="muted">Household income</p><h3 id="metricIncome">€0.00</h3></article>
+            <article class="card stat"><p class="muted">Gross expenses</p><h3 id="metricGrossExpense">€0.00</h3></article>
+            <article class="card stat"><p class="muted">Income linked to expenses</p><h3 id="metricLinkedIncome">€0.00</h3></article>
+          </div>
+          <div class="grid cards4">
+            <article class="card stat"><p class="muted">Net expenses after linked income</p><h3 id="metricNetExpense">€0.00</h3></article>
+            <article class="card stat"><p class="muted">Remaining household income</p><h3 id="metricRemaining">€0.00</h3></article>
+            <article class="card stat"><p class="muted">Mandatory expenses</p><h3 id="metricMandatory">€0.00</h3></article>
+            <article class="card stat"><p class="muted">Avoidable expenses</p><h3 id="metricAvoidable">€0.00</h3></article>
+          </div>
+        </section>
+
+        <section class="card tabs">
+          <button class="tab-btn active" data-tab="expense" type="button">Add Expense</button>
+          <button class="tab-btn" data-tab="income" type="button">Add Income</button>
+        </section>
+
+        <section id="tab-expense" data-tab-panel class="card">
+          <form id="expenseForm" class="grid-form">
+            <label>Amount <input name="amount" type="number" min="0.01" step="0.01" required /></label>
+            <label>Expense date <input name="expenseDate" type="date" required /></label>
+            <label>Frequency <select name="expenseFrequency">${FREQUENCIES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
+            <label>Category <input name="category" required maxlength="60" /></label>
+            <label>Mandatory or Avoidable <select name="expenseType">${EXPENSE_TYPES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
+            <label>Recurring <select name="recurring"><option value="yes">Yes</option><option value="no">No</option></select></label>
+            <label class="wide">Optional note <textarea name="note" maxlength="300"></textarea></label>
+            <div class="actions">
+              <button id="saveExpenseButton" type="submit">Save expense</button>
+              <button id="cancelExpenseEditButton" class="secondary hidden" type="button">Cancel edit</button>
+            </div>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Date</th><th>Amount</th><th>Frequency</th><th>Category</th><th>Type</th><th>Recurring</th><th>Note</th><th>Actions</th></tr></thead>
+              <tbody id="expenseTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="tab-income" data-tab-panel class="card hidden">
+          <form id="incomeForm" class="grid-form">
+            <label>Amount <input name="amount" type="number" min="0.01" step="0.01" required /></label>
+            <label>Income date <input name="incomeDate" type="date" required /></label>
+            <label>Frequency <select name="incomeFrequency">${FREQUENCIES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
+            <label>Category <input name="category" required maxlength="60" /></label>
+            <label>Relates to Expense (optional) <input name="relatesToExpense" maxlength="60" list="expenseCategoryList" /></label>
+            <label>Permanent or Temporary <select name="incomeType">${INCOME_TYPES.map((x) => `<option value="${x}">${x}</option>`).join('')}</select></label>
+            <label>Recurring <select name="recurring"><option value="yes">Yes</option><option value="no">No</option></select></label>
+            <label class="wide">Optional note <textarea name="note" maxlength="300"></textarea></label>
+            <div class="actions">
+              <button id="saveIncomeButton" type="submit">Save income</button>
+              <button id="cancelIncomeEditButton" class="secondary hidden" type="button">Cancel edit</button>
+            </div>
+          </form>
+          <datalist id="expenseCategoryList"></datalist>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Date</th><th>Amount</th><th>Frequency</th><th>Category</th><th>Relates to Expense</th><th>Type</th><th>Recurring</th><th>Note</th><th>Actions</th></tr></thead>
+              <tbody id="incomeTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="toolbar">
+            <button id="exportCsvButton" class="secondary" type="button">Export CSV</button>
+            <button id="exportExcelButton" class="secondary" type="button">Export Excel</button>
+            <button id="backupButton" class="secondary" type="button">Backup JSON</button>
+            <label class="file-label secondary">Restore JSON<input id="restoreInput" type="file" accept=".json,application/json" /></label>
+          </div>
+        </section>
+      </section>
+    </main>
+  `;
+}
+
+function renderExpenseCategoryList() {
+  const set = new Set(state.data.expenses.map((x) => x.category).filter(Boolean));
+  document.querySelector('#expenseCategoryList').innerHTML = Array.from(set)
+    .sort((a, b) => a.localeCompare(b))
+    .map((x) => `<option value="${escapeHtml(x)}"></option>`)
+    .join('');
 }
 
 function bindEvents() {
   document.querySelector('#unlockForm').addEventListener('submit', (e) => {
     e.preventDefault();
-    const form = new FormData(e.target);
-    const nameRaw = String(form.get('name') || '').trim();
+    const fd = new FormData(e.currentTarget);
+    const nameRaw = String(fd.get('name') || '').trim();
     const name = nameRaw.toLowerCase();
-    const dob = String(form.get('dob') || '').trim();
-    if (!name || !dob) return showToast('Enter name and DOB.', true);
+    const dob = String(fd.get('dob') || '').trim();
     if (!APPROVED_NAMES.includes(name)) return showToast('Name is not approved.', true);
-    if (dob !== todayIso()) return showToast("DOB must match today's date for this access rule.", true);
+    if (dob !== todayIso()) return showToast("DOB must match today's date.", true);
     state.user = nameRaw;
     state.unlocked = true;
     sessionStorage.setItem(SESSION_UNLOCK_KEY, JSON.stringify({ user: state.user, ts: Date.now() }));
     setVisibleView('#appView');
-    renderActiveTab();
-    resetTxForm();
+    resetExpenseForm();
+    resetIncomeForm();
+    renderExpenseCategoryList();
+    renderAll();
+    startPolling();
   });
 
   document.querySelector('#lockButton').addEventListener('click', () => {
     state.unlocked = false;
     state.user = '';
     sessionStorage.removeItem(SESSION_UNLOCK_KEY);
+    if (state.pollHandle) clearInterval(state.pollHandle);
+    state.pollHandle = null;
     setVisibleView('#gateView');
   });
 
   document.querySelectorAll('.tab-btn').forEach((btn) =>
     btn.addEventListener('click', () => {
-      state.tab = btn.dataset.tabTarget;
-      renderActiveTab();
+      state.activeTab = btn.dataset.tab;
+      renderTabs();
     }),
   );
 
-  document.querySelector('#txForm').addEventListener('submit', (e) => {
-    try {
-      handleTxSubmit(e);
-    } catch (err) {
-      showToast(err.message, true);
+  document.querySelector('#expenseForm').addEventListener('submit', (e) =>
+    handleSaveExpense(e).catch((err) => showToast(err.message, true)),
+  );
+  document.querySelector('#incomeForm').addEventListener('submit', (e) =>
+    handleSaveIncome(e).catch((err) => showToast(err.message, true)),
+  );
+  document.querySelector('#cancelExpenseEditButton').addEventListener('click', resetExpenseForm);
+  document.querySelector('#cancelIncomeEditButton').addEventListener('click', resetIncomeForm);
+
+  document.querySelector('#expenseTableBody').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    if (btn.dataset.action === 'edit-expense') editExpense(id);
+    if (btn.dataset.action === 'delete-expense' && window.confirm('Delete this expense?')) {
+      deleteExpense(id).catch((err) => showToast(err.message, true));
     }
   });
-  document.querySelector('#quickAddIncomeButton').addEventListener('click', () => {
-    const form = document.querySelector('#txForm');
-    form.type.value = 'income';
-    updateTxFormVisibility();
-    form.amount.focus();
-  });
-  document.querySelector('#quickAddExpenseButton').addEventListener('click', () => {
-    const form = document.querySelector('#txForm');
-    form.type.value = 'expense';
-    updateTxFormVisibility();
-    form.amount.focus();
-  });
-  document.querySelector('#txType').addEventListener('change', updateTxFormVisibility);
-  document.querySelector('#txFrequency').addEventListener('change', updateTxFormVisibility);
-  document.querySelector('#cancelTxEditButton').addEventListener('click', resetTxForm);
-  document.querySelector('#txTableBody').addEventListener('click', handleTxActions);
-
-  document.querySelector('#budgetForm').addEventListener('submit', (e) => {
-    e.preventDefault();
-    const amount = Number(new FormData(e.target).get('budget'));
-    if (!Number.isFinite(amount) || amount < 0) return showToast('Enter a valid budget.', true);
-    state.data.monthlyBudget = amount;
-    saveData();
-    renderDashboardTab();
-  });
-
-  const addCategoryHandler = (e) => {
-    e.preventDefault();
-    try {
-      addCategory(new FormData(e.target).get('name'));
-      e.target.reset();
-      renderActiveTab();
-    } catch (err) {
-      showToast(err.message, true);
-    }
-  };
-  document.querySelector('#addCategoryForm').addEventListener('submit', addCategoryHandler);
-  document.querySelector('#addCategoryForm2').addEventListener('submit', addCategoryHandler);
-
-  const addGroupHandler = (e) => {
-    e.preventDefault();
-    try {
-      addGroup(new FormData(e.target).get('name'));
-      e.target.reset();
-      renderActiveTab();
-    } catch (err) {
-      showToast(err.message, true);
-    }
-  };
-  document.querySelector('#addGroupQuickForm').addEventListener('submit', addGroupHandler);
-  document.querySelector('#addGroupForm').addEventListener('submit', addGroupHandler);
-
-  document.querySelector('#groupsTableBody').addEventListener('click', (e) => {
-    const button = e.target.closest('button[data-action]');
-    if (!button) return;
-    const id = button.dataset.id;
-    const group = state.data.groups.find((g) => g.id === id);
-    if (!group) return;
-
-    if (button.dataset.action === 'rename-group') {
-      const next = window.prompt('New group name:', group.name);
-      if (!next) return;
-      group.name = next.trim();
-      saveData();
-      renderActiveTab();
-      return;
-    }
-
-    if (button.dataset.action === 'delete-group') {
-      const inUse = state.data.transactions.some((t) => t.groupId === id);
-      if (inUse) return showToast('Group is used by transactions. Reassign them first.', true);
-      state.data.groups = state.data.groups.filter((g) => g.id !== id);
-      saveData();
-      renderActiveTab();
+  document.querySelector('#incomeTableBody').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    if (btn.dataset.action === 'edit-income') editIncome(id);
+    if (btn.dataset.action === 'delete-income' && window.confirm('Delete this income?')) {
+      deleteIncome(id).catch((err) => showToast(err.message, true));
     }
   });
 
-  document.querySelector('#categoriesTableBody').addEventListener('click', (e) => {
-    const button = e.target.closest('button[data-action]');
-    if (!button) return;
-    const name = String(button.dataset.name || '');
-    if (button.dataset.action !== 'delete-category') return;
-    const inUse = state.data.transactions.some((t) => t.category === name);
-    if (inUse) return showToast('Category is used by transactions. Reassign first.', true);
-    state.data.categories = state.data.categories.filter((c) => c !== name);
-    saveData();
-    renderActiveTab();
+  document.querySelector('#viewMode').addEventListener('change', (e) => {
+    state.view.mode = e.target.value;
+    renderAll();
   });
-
-  document.querySelector('#txFilterForm').addEventListener('input', (e) => {
-    const form = e.currentTarget;
-    state.filters.q = String(form.q.value || '');
-    state.filters.type = String(form.type.value || '');
-    state.filters.groupId = String(form.groupId.value || '');
-    state.filters.month = String(form.month.value || '');
-    renderTransactionsTab();
+  document.querySelector('#viewMonth').addEventListener('change', (e) => {
+    state.view.month = e.target.value || todayMonth();
+    renderAll();
   });
-
-  document.querySelector('#clearTxFilters').addEventListener('click', () => {
-    state.filters = { q: '', type: '', groupId: '', month: '' };
-    document.querySelector('#txFilterForm').reset();
-    renderTransactionsTab();
+  document.querySelector('#viewYear').addEventListener('change', (e) => {
+    state.view.year = String(e.target.value || new Date().getFullYear());
+    renderAll();
   });
+  document.querySelector('#reloadButton').addEventListener('click', () =>
+    loadData()
+      .then(() => {
+        renderExpenseCategoryList();
+        renderAll();
+      })
+      .catch((err) => showToast(err.message, true)),
+  );
 
   document.querySelector('#exportCsvButton').addEventListener('click', () => {
     try {
@@ -1136,12 +816,14 @@ function bindEvents() {
       showToast(err.message, true);
     }
   });
-  document.querySelector('#backupButton').addEventListener('click', backupJson);
+  document.querySelector('#backupButton').addEventListener('click', exportJson);
   document.querySelector('#restoreInput').addEventListener('change', async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
       await restoreJson(file);
+      renderExpenseCategoryList();
+      renderAll();
       showToast('Backup restored.');
     } catch (err) {
       showToast(err.message, true);
@@ -1149,49 +831,26 @@ function bindEvents() {
       e.target.value = '';
     }
   });
-
-  document.querySelector('#optionalReduction').addEventListener('input', (e) => {
-    state.scenario.optionalReductionPct = Number(e.target.value || 0);
-    renderWhatIfTab();
-  });
-  document.querySelector('#whatIfIncomeBody').addEventListener('input', (e) => {
-    const target = e.target;
-    if (target.dataset.action === 'toggle-income') {
-      const id = target.dataset.id;
-      const keep = target.checked;
-      state.scenario.removedIncomeIds = keep ? state.scenario.removedIncomeIds.filter((x) => x !== id) : [...new Set([...state.scenario.removedIncomeIds, id])];
-      renderWhatIfTab();
-      return;
-    }
-    if (target.dataset.action === 'override-income') {
-      const id = target.dataset.id;
-      const value = String(target.value || '').trim();
-      if (!value) {
-        delete state.scenario.incomeOverrides[id];
-      } else {
-        const numeric = Number(value);
-        if (Number.isFinite(numeric) && numeric >= 0) state.scenario.incomeOverrides[id] = numeric;
-      }
-      renderWhatIfTab();
-    }
-  });
 }
 
-function main() {
-  state.data = migrateData(loadJson(STORAGE_KEY, structuredClone(DEFAULT_DATA)));
+async function main() {
   renderShell();
   bindEvents();
+  await loadData();
 
   const session = loadJson(SESSION_UNLOCK_KEY, null);
   if (session?.user) {
     state.user = String(session.user);
     state.unlocked = true;
     setVisibleView('#appView');
-    renderActiveTab();
-    resetTxForm();
+    resetExpenseForm();
+    resetIncomeForm();
+    renderExpenseCategoryList();
+    renderAll();
+    startPolling();
   } else {
     setVisibleView('#gateView');
   }
 }
 
-main();
+main().catch((err) => showToast(err.message, true));
