@@ -1,82 +1,115 @@
-# Household Expense Tracker
+# Household Expense Tracker (Self-Hosted Secure Setup)
 
-A mobile-friendly shared household expense tracker for two authenticated users, built as a static frontend with Supabase authentication + Postgres + Row Level Security (RLS).
+Mobile-friendly shared expense tracker for two household members, with separate login accounts and one shared household dataset.
 
-## Why this architecture
+## Architecture choice
 
-This project uses a static JavaScript frontend and Supabase backend instead of Node.js/Spring because it is the simplest maintainable option that still gives:
+This version uses:
 
-- Separate sign-in per person
-- Shared real-time-ish cloud data
-- Strong database-level access controls (RLS)
-- No custom backend server to maintain
+- **Frontend:** Vite + Vanilla JavaScript + CSS
+- **Backend:** Node.js (Express)
+- **Database:** PostgreSQL (self-hosted) with **Row Level Security (RLS)**
 
-## Features
+Why this choice: it satisfies your requirement for strong privacy/security with database-enforced access rules, while keeping the stack maintainable.
 
-- Quick expense entry: amount, date, category, description, who paid, optional notes
-- Add, edit, delete, search, filter expenses
-- Dashboard: this month total, by category, by person, 6-month trend
-- Monthly budget with clear approaching/exceeded status
-- EUR formatting with Ireland locale (`en-IE`)
+## Features included
+
+- Separate sign-in for each person
+- Quick entry fields: amount, date, category, description, who paid, optional notes
+- Add / edit / delete expenses
+- Search + filters (text/category/person/month)
+- Dashboard:
+  - This month total
+  - Spending by category
+  - Spending by person
+  - 6-month spending trend
+- Monthly budget with clear status:
+  - On track
+  - Approaching budget (>=80%)
+  - Budget exceeded
+- EUR currency with Ireland-friendly date formatting (`en-IE`)
 - CSV export
-- Backup and restore via JSON
+- JSON backup and restore
 
-## Stack
+## Security model
 
-- Vite + Vanilla JavaScript + CSS
-- Supabase Auth + Postgres + RLS
+- Authentication uses hashed passwords (`bcrypt`), never plaintext.
+- API issues signed JWT tokens.
+- Every DB request sets authenticated user context (`app.current_user_id`).
+- PostgreSQL **RLS policies** enforce that only household members can read/write household data.
+- Unauthorized users cannot access `/api/*` protected routes.
+- No secrets are committed to Git.
 
-## Setup
+## Project structure
 
-1. Create a Supabase project.
-2. In Supabase SQL editor, run `supabase/schema.sql`.
-3. In Supabase Auth settings:
-   - Enable Email/Password provider.
-   - Set email confirmation as you prefer (on/off).
-4. Copy `.env.example` to `.env.local` and fill:
+- `src/` – frontend
+- `server/src/` – API server
+- `server/db/init/` – PostgreSQL bootstrap + schema + RLS policies
+- `docker-compose.yml` – self-hosted local/prod base stack
+- `Dockerfile` – builds frontend and backend into one app image
+
+## Quick start (Docker)
+
+1. Install Docker Desktop.
+2. In project root:
 
 ```bash
-VITE_SUPABASE_URL=...
-VITE_SUPABASE_ANON_KEY=...
+docker compose up --build
 ```
 
-5. Install and run:
+3. Open:
+
+- App: `http://localhost:4000`
+- API health: `http://localhost:4000/api/health`
+
+## Development mode (without Docker)
+
+### Backend
+
+1. Create PostgreSQL database and run SQL scripts in `server/db/init` in order.
+2. Create `server/.env` from `server/.env.example`.
+3. Run:
+
+```bash
+cd server
+npm install
+npm run dev
+```
+
+### Frontend
+
+In root:
 
 ```bash
 npm install
 npm run dev
 ```
 
-6. Open the app, create 2 user accounts, then:
-   - First account: create household.
-   - Second account: join with invite code shown in the app.
+Vite proxies `/api` to `http://localhost:4000`.
 
-## Security model
+## First use
 
-- App access requires sign-in.
-- Supabase RLS policies enforce that only household members can read/write that household's expenses and budget.
-- Data isolation is enforced in database policies, not hidden frontend routes.
-- No service-role keys are used in frontend.
+1. Create account 1 and sign in.
+2. Create household and budget.
+3. Create account 2 and sign in.
+4. Join household with invite code shown in account 1.
+5. Add expenses from both accounts and confirm shared visibility.
 
-## Backup/restore
+## Backup and restore
 
-- **Backup JSON** exports household budget + expenses.
-- **Restore JSON** validates household ID and upserts records.
-- **Export CSV** gives a spreadsheet-friendly copy.
+- **Backup JSON:** includes household budget + expenses.
+- **Restore JSON:** validates household and upserts records.
+- **Export CSV:** downloadable copy for your own records.
 
-## Deploy (private repo + free host)
+## Self-host deployment options
 
-Recommended: Netlify (free) connected to private GitHub repo.
+- VPS + Docker Compose (recommended for full control)
+- Home server / NAS with Docker
+- Any container host where you manage Postgres + app secrets
 
-- Build command: `npm run build`
-- Publish directory: `dist`
-- Environment variables:
-  - `VITE_SUPABASE_URL`
-  - `VITE_SUPABASE_ANON_KEY`
+Use HTTPS and rotate JWT/database secrets in production.
 
-## Free-tier limits (typical)
+## Free-tier guidance
 
-- **Supabase Free**: limited database size, auth quotas, and inactivity pausing.
-- **Netlify Free**: limited monthly bandwidth/build minutes and project usage caps.
-
-Check your provider dashboard for current exact quotas.
+Self-hosted means no managed-service free-tier lock-in, but you pay for whichever host you choose (or use your own hardware).  
+If you want a fully free internet-facing deployment, you usually need managed PaaS accounts; this self-hosted setup intentionally avoids that dependency.
